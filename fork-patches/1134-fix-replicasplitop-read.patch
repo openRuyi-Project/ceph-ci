@@ -1,0 +1,628 @@
+From 5e0595bb19e73256051cb748bac85fd516472330 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Tue, 14 Jul 2026 14:31:40 +0800
+Subject: [PATCH 1/4] osdc: fix ReplicaSplitOp chunk distribution and
+ reassembly
+
+ReplicaSplitOp::init_read() distributed chunks over a window of acting
+indices starting at the random reference_sub_read and wrapping at the
+OSD count. This broke reads in two ways:
+
+- assemble_buffer_read() concatenates sub-read buffers in ascending
+  acting-index order, but chunks were assigned in window order, so a
+  wrapped window was reassembled in the wrong order.
+
+- chunk_size rounded the division down, which can produce one more
+  chunk than slice_count. The extra chunk wrapped the window fully
+  around and attached a second read sharing one output buffer to the
+  first sub-read.
+
+Round the division up, and distribute the chunks over an explicit
+window of valid acting indices assigned in ascending order.
+init_reference_sub_read() now collects those indices and picks one of
+them, matching ECSplitOp.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/osdc/SplitOp.cc | 61 +++++++++++++++++++++++----------------------
+ src/osdc/SplitOp.h  | 10 +++++++-
+ 2 files changed, 40 insertions(+), 31 deletions(-)
+
+diff --git a/src/osdc/SplitOp.cc b/src/osdc/SplitOp.cc
+index 7fbc65595442..962f537caad4 100644
+--- a/src/osdc/SplitOp.cc
++++ b/src/osdc/SplitOp.cc
+@@ -9,6 +9,8 @@
+  * Foundation.  See file COPYING.
+  */
+ 
++#include <algorithm>
++
+ #include "osdc/SplitOp.h"
+ #include "osdc/Objecter.h"
+ #include "osd/osd_types.h"
+@@ -249,29 +251,27 @@ void ECSplitOp::init_read(OSDOp &op, bool sparse, int ops_index) {
+ /**
+  * @brief Initialize reference_sub_read to a random valid OSD.
+  *
+- * Counts valid OSDs in the acting set and picks a random acting index.
+- * Must be called after _calc_target() populates the acting set.
++ * Collects the valid acting indices and picks one at random. Must be
++ * called after _calc_target() populates the acting set.
+  */
+ void ReplicaSplitOp::init_reference_sub_read() {
+   auto &target = orig_op->target;
+-  
+-  // Count valid OSDs in the acting set
+-  int valid_osd_count = 0;
++
+   for (size_t i = 0; i < target.acting.size(); i++) {
+     int direct_osd = target.acting[i];
+     if (objecter.osdmap->exists(direct_osd)) {
+-      valid_osd_count++;
++      valid_indices.push_back(i);
+     }
+   }
+-  
+-  if (valid_osd_count < 2) {
++
++  if (valid_indices.size() < 2) {
+     abort = true;
+     ldout(cct, DBG_LVL) << __func__ << " ABORT: Not enough valid OSDs" << dendl;
+     return;
+   }
+-  
+-  // Pick a random valid acting index
+-  reference_sub_read = rand() % valid_osd_count;
++
++  reference_valid_index = rand() % valid_indices.size();
++  reference_sub_read = valid_indices[reference_valid_index];
+ }
+ 
+ /**
+@@ -332,18 +332,8 @@ void ReplicaSplitOp::init_read(OSDOp &op, bool sparse, int ops_index) {
+   const pg_pool_t *pi = objecter.osdmap->get_pg_pool(target.base_oloc.pool);
+   ceph_assert(pi);
+ 
+-  std::set<int> osds;
+-  for (int direct_osd : target.acting) {
+-    if (objecter.osdmap->exists(direct_osd)) {
+-      osds.insert(direct_osd);
+-    }
+-  }
+-
+-  if (osds.size() < 2) {
+-    ldout(cct, DBG_LVL) << __func__ <<" ABORT: No OSDs" << dendl;
+-    abort = true;
+-    return;
+-  }
++  // init_reference_sub_read() aborts on < 2 valid OSDs; checked by create().
++  ceph_assert(valid_indices.size() >= 2);
+ 
+   uint64_t replica_min_shard_read_size
+     = objecter.get_min_split_replica_read_size();
+@@ -352,13 +342,23 @@ void ReplicaSplitOp::init_read(OSDOp &op, bool sparse, int ops_index) {
+   uint64_t length = op.op.extent.length;
+   uint64_t slice_count = replica_min_shard_read_size == 0 ? 1 :
+                           std::min(length / replica_min_shard_read_size,
+-                                   osds.size());
+-  uint64_t chunk_size = p2roundup(length / slice_count, (uint64_t)CEPH_PAGE_SIZE);
+-  
+-  // Use reference_sub_read (set in constructor) as the starting shard
+-  // This provides load balancing while ensuring reference_sub_read is always set
+-  for (unsigned i = reference_sub_read; length > 0; i = (i + 1 == osds.size()) ? 0 : i + 1) {
+-    int acting_index = i;
++                                   valid_indices.size());
++  // Round up, otherwise chunk_count can exceed slice_count and reuse a
++  // sub-read.
++  uint64_t chunk_size = p2roundup(div_round_up(length, slice_count),
++                                  (uint64_t)CEPH_PAGE_SIZE);
++  uint64_t chunk_count = div_round_up(length, chunk_size);
++
++  // Window starts at reference_sub_read for load balancing; chunks are
++  // assigned in ascending acting-index order to match assemble_buffer_read().
++  std::vector<int> chosen_indices;
++  for (uint64_t i = 0; i < chunk_count; i++) {
++    chosen_indices.push_back(
++      valid_indices[(reference_valid_index + i) % valid_indices.size()]);
++  }
++  std::sort(chosen_indices.begin(), chosen_indices.end());
++
++  for (int acting_index : chosen_indices) {
+     if (!sub_reads.contains(acting_index)) {
+       sub_reads.emplace(acting_index, orig_op->ops.size() + 1);
+     }
+@@ -375,6 +375,7 @@ void ReplicaSplitOp::init_read(OSDOp &op, bool sparse, int ops_index) {
+     offset += len;
+     length -= len;
+   }
++  ceph_assert(length == 0);
+ }
+ 
+ #undef dout_prefix
+diff --git a/src/osdc/SplitOp.h b/src/osdc/SplitOp.h
+index ae0a86d3c936..e2b0f41d86ae 100644
+--- a/src/osdc/SplitOp.h
++++ b/src/osdc/SplitOp.h
+@@ -557,7 +557,15 @@ class ReplicaSplitOp : public SplitOp {
+   bool version_mismatch() const override;
+   
+   void init_reference_sub_read() override;
+-  
++
++  /**
++   * Acting indices that map to an existing OSD, in ascending order.
++   * Populated by init_reference_sub_read(), consumed by init_read().
++   */
++  std::vector<int> valid_indices;
++
++  size_t reference_valid_index = 0;
++
+   /**
+    * @brief Construct a ReplicaSplitOp.
+    * @param op Original operation to be split
+
+From 1a37e205ec08b95738fc450280a1c2a4d9657d5f Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Tue, 14 Jul 2026 14:31:40 +0800
+Subject: [PATCH 2/4] osdc: handle reads below the min split size in multi-op
+ requests
+
+Splitting validation only requires one op in a request to reach the
+minimum split size, so a multi-op request may carry a shorter read.
+ReplicaSplitOp::init_read() crashed on a division by zero for such an
+op; clamp slice_count to one, serving it whole from the reference OSD.
+
+The op then holds details on the reference sub-read only, but
+assemble_buffer_read() and assemble_buffer_sparse_read() called
+details.at(ops_index) on every sub-read; mini_flat_map::at() throws
+std::out_of_range for a missing key, and complete() runs from the
+destructor, so such a request terminated the client. Skip sub-reads
+that did not take part in the op.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/osdc/SplitOp.cc | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/osdc/SplitOp.cc b/src/osdc/SplitOp.cc
+index 962f537caad4..a32ee9dbd7fa 100644
+--- a/src/osdc/SplitOp.cc
++++ b/src/osdc/SplitOp.cc
+@@ -288,6 +288,10 @@ std::pair<SplitOp::extent_set, bufferlist> ReplicaSplitOp::assemble_buffer_spars
+   bufferlist bl_out;
+ 
+   for (auto && [acting_index, sr] : sub_reads) {
++    // Ops with fewer chunks than sub-reads do not use every sub-read.
++    if (!sr.details.contains(ops_index)) {
++      continue;
++    }
+     for (auto [off, len] : *sr.details.at(ops_index).e) {
+       extents_out.insert(off, len);
+     }
+@@ -307,6 +311,9 @@ std::pair<SplitOp::extent_set, bufferlist> ReplicaSplitOp::assemble_buffer_spars
+  */
+ void ReplicaSplitOp::assemble_buffer_read(bufferlist &bl_out, int ops_index) const {
+   for (auto && [acting_index, sr] : sub_reads) {
++    if (!sr.details.contains(ops_index)) {
++      continue;
++    }
+     bl_out.append(sr.details.at(ops_index).bl);
+   }
+ }
+@@ -343,6 +350,9 @@ void ReplicaSplitOp::init_read(OSDOp &op, bool sparse, int ops_index) {
+   uint64_t slice_count = replica_min_shard_read_size == 0 ? 1 :
+                           std::min(length / replica_min_shard_read_size,
+                                    valid_indices.size());
++  // A multi-op request may carry a read shorter than the minimum split
++  // size; serve it whole from the reference OSD.
++  slice_count = std::max<uint64_t>(slice_count, 1);
+   // Round up, otherwise chunk_count can exceed slice_count and reuse a
+   // sub-read.
+   uint64_t chunk_size = p2roundup(div_round_up(length, slice_count),
+
+From 2cd80eabf67c03ea1fa0a1c261c1f9969b79cea0 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Tue, 14 Jul 2026 14:31:40 +0800
+Subject: [PATCH 3/4] test/librados: cover ReplicaSplitOp reassembly and
+ multi-op reads
+
+Add replica split-op regression tests using patterned data; the
+existing tests write zeros, which cannot detect misordered
+reassembly. The new cases cover a wrapped chunk window, an
+unaligned length producing more chunks than slices, and a read
+below the minimum split size in a multi-op request.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/test/librados/split_op_cxx.cc | 209 ++++++++++++++++++++----------
+ 1 file changed, 144 insertions(+), 65 deletions(-)
+
+diff --git a/src/test/librados/split_op_cxx.cc b/src/test/librados/split_op_cxx.cc
+index eecb6d3a2c6d..ff4c3d829824 100644
+--- a/src/test/librados/split_op_cxx.cc
++++ b/src/test/librados/split_op_cxx.cc
+@@ -12,6 +12,21 @@ using namespace librados;
+ using namespace cls;
+ using namespace rados::cls;
+ 
++namespace {
++// Misordered reassembly of split reads is invisible with all-zero data,
++// so tests that verify read contents need a patterned buffer.
++bufferlist make_pattern_bl(uint64_t len) {
++  bufferlist bl;
++  std::string s;
++  s.reserve(len);
++  for (uint64_t i = 0; i < len; i++) {
++    s.push_back(static_cast<char>((i * 131) % 251));
++  }
++  bl.append(s);
++  return bl;
++}
++} // namespace
++
+ class LibRadosSplitOpPP : public RadosTestPP {
+ public:
+   static void SetUpTestCase() {
+@@ -22,6 +37,49 @@ class LibRadosSplitOpPP : public RadosTestPP {
+     ASSERT_EQ("", create_pool_pp(pool_name_default, s_cluster, 3));
+     s_cluster.wait_for_latest_osdmap();
+   }
++
++protected:
++  // Write a second object in the same PG; that flushes the commit of the
++  // preceding write, which split reads need. Uses ASSERT_*.
++  void stabilize_pg_log(const bufferlist &bl) {
++    uint32_t hash_position;
++    ASSERT_EQ(0, ioctx.get_object_pg_hash_position2("foo", &hash_position));
++
++    std::string other_object = "other";
++    while (true) {
++      uint32_t hash_position2;
++      ASSERT_EQ(0, ioctx.get_object_pg_hash_position2(other_object, &hash_position2));
++      if (hash_position == hash_position2) {
++        break;
++      }
++      other_object += ".";
++    }
++    ObjectWriteOperation write2;
++    write2.write(0, bl);
++    ASSERT_TRUE(AssertOperateWithoutSplitOp(0, other_object, &write2));
++  }
++
++  // Write num_slices * osd_min_split_replica_read_size + extra_bytes of
++  // patterned data to "foo". Uses ASSERT_*.
++  void write_pattern_object(uint64_t num_slices, uint64_t extra_bytes,
++                            bufferlist *written) {
++    std::string min_split_size_str;
++    ASSERT_EQ(0, cluster.conf_get("osd_min_split_replica_read_size", min_split_size_str));
++    uint64_t min_split_size = std::stoull(min_split_size_str);
++    // With split ops disabled the option is 0; keep the data non-empty so
++    // the content checks are meaningful in the non-split variant too.
++    if (min_split_size == 0) {
++      min_split_size = 262144;
++    }
++
++    bufferlist bl = make_pattern_bl(num_slices * min_split_size + extra_bytes);
++    ObjectWriteOperation write1;
++    write1.write(0, bl);
++    ASSERT_TRUE(AssertOperateWithoutSplitOp(0, "foo", &write1));
++    ASSERT_NO_FATAL_FAILURE(stabilize_pg_log(bl));
++
++    *written = std::move(bl);
++  }
+ };
+ 
+ typedef RadosTestECPP LibRadosSplitOpECPP;
+@@ -46,25 +104,10 @@ TEST_P(LibRadosSplitOpPP, BigRead) {
+   uint64_t min_split_size = std::stoull(min_split_size_str);
+   bufferlist bl;
+   bl.append_zero(3 * min_split_size);
+-  ObjectWriteOperation write1, write2;
++  ObjectWriteOperation write1;
+   write1.write(0, bl);
+-  uint32_t hash_position;
+   ASSERT_TRUE(AssertOperateWithoutSplitOp(0, "foo", &write1));
+-  ASSERT_EQ(0, ioctx.get_object_pg_hash_position2("foo", &hash_position));
+-
+-  std::string other_object = "other";
+-  while (true) {
+-    uint32_t hash_position2;
+-    ASSERT_EQ(0, ioctx.get_object_pg_hash_position2(other_object, &hash_position2));
+-    if (hash_position == hash_position2) {
+-      break;
+-    }
+-    other_object += ".";
+-  }
+-  // The second write flushes the commit of the first.
+-  write2.write(0, bl);
+-  ASSERT_TRUE(AssertOperateWithoutSplitOp(0, other_object, &write2));
+-
++  ASSERT_NO_FATAL_FAILURE(stabilize_pg_log(bl));
+ 
+   ObjectReadOperation read;
+   read.read(0, bl.length(), NULL, NULL);
+@@ -80,24 +123,10 @@ TEST_P(LibRadosSplitOpPP, ReadTwoShards) {
+   // Write data large enough to cover multiple shards
+   bufferlist bl;
+   bl.append_zero(min_split_size * 3);
+-  ObjectWriteOperation write1, write2;
++  ObjectWriteOperation write1;
+   write1.write(0, bl);
+-  uint32_t hash_position;
+   ASSERT_TRUE(AssertOperateWithoutSplitOp(0, "foo", &write1));
+-  ASSERT_EQ(0, ioctx.get_object_pg_hash_position2("foo", &hash_position));
+-
+-  std::string other_object = "other";
+-  while (true) {
+-    uint32_t hash_position2;
+-    ASSERT_EQ(0, ioctx.get_object_pg_hash_position2(other_object, &hash_position2));
+-    if (hash_position == hash_position2) {
+-      break;
+-    }
+-    other_object += ".";
+-  }
+-  // The second write flushes the commit of the first.
+-  write2.write(0, bl);
+-  ASSERT_TRUE(AssertOperateWithoutSplitOp(0, other_object, &write2));
++  ASSERT_NO_FATAL_FAILURE(stabilize_pg_log(bl));
+ 
+   // Test 1: Read exactly osd_min_split_replica_read_size - should NOT split
+   {
+@@ -149,24 +178,10 @@ TEST_P(LibRadosSplitOpPP, StatBeforeRead) {
+   // Use buffer at least 2x min_split_size to force splitting across replicas
+   bufferlist bl;
+   bl.append_zero(min_split_size * 2);
+-  ObjectWriteOperation write1, write2;
++  ObjectWriteOperation write1;
+   write1.write(0, bl);
+-  uint32_t hash_position;
+   ASSERT_TRUE(AssertOperateWithoutSplitOp(0, "foo", &write1));
+-  ASSERT_EQ(0, ioctx.get_object_pg_hash_position2("foo", &hash_position));
+-
+-  std::string other_object = "other";
+-  while (true) {
+-    uint32_t hash_position2;
+-    ASSERT_EQ(0, ioctx.get_object_pg_hash_position2(other_object, &hash_position2));
+-    if (hash_position == hash_position2) {
+-      break;
+-    }
+-    other_object += ".";
+-  }
+-  // The second write flushes the commit of the first.
+-  write2.write(0, bl);
+-  ASSERT_TRUE(AssertOperateWithoutSplitOp(0, other_object, &write2));
++  ASSERT_NO_FATAL_FAILURE(stabilize_pg_log(bl));
+ 
+   // This test verifies the bug fix: STAT operation comes BEFORE READ
+   // In ReplicaSplitOp::init(), when processing ops in order:
+@@ -208,26 +223,12 @@ TEST_P(LibRadosSplitOpPP, GetXattrBeforeRead) {
+   std::string attr_value = "my_attr";
+ 
+   bl.append_zero(min_split_size * 2);
+-  ObjectWriteOperation write1, write2;
++  ObjectWriteOperation write1;
+   write1.write(0, bl);
+   encode(attr_value, attr_bl);
+   write1.setxattr(attr_key.c_str(), attr_bl);
+-  uint32_t hash_position;
+   ASSERT_TRUE(AssertOperateWithoutSplitOp(0, "foo", &write1));
+-  ASSERT_EQ(0, ioctx.get_object_pg_hash_position2("foo", &hash_position));
+-
+-  std::string other_object = "other";
+-  while (true) {
+-    uint32_t hash_position2;
+-    ASSERT_EQ(0, ioctx.get_object_pg_hash_position2(other_object, &hash_position2));
+-    if (hash_position == hash_position2) {
+-      break;
+-    }
+-    other_object += ".";
+-  }
+-  // The second write flushes the commit of the first.
+-  write2.write(0, bl);
+-  ASSERT_TRUE(AssertOperateWithoutSplitOp(0, other_object, &write2));
++  ASSERT_NO_FATAL_FAILURE(stabilize_pg_log(bl));
+ 
+   // Another variant of the bug: GETXATTR before READ
+   // This verifies that init_reference_sub_read() is called before processing GETXATTR
+@@ -246,6 +247,84 @@ TEST_P(LibRadosSplitOpPP, GetXattrBeforeRead) {
+   ASSERT_EQ(min_split_size * 2, read_bl.length());
+ }
+ 
++TEST_P(LibRadosSplitOpPP, BigReadPattern) {
++  bufferlist bl;
++  ASSERT_NO_FATAL_FAILURE(write_pattern_object(3, 0, &bl));
++
++  // The chunk window starts at a random acting index; repeat so that a
++  // wrapped window is exercised.
++  for (int i = 0; i < 8; i++) {
++    ObjectReadOperation read;
++    bufferlist read_bl;
++    read.read(0, bl.length(), NULL, NULL);
++    ASSERT_TRUE(AssertOperateWithSplitOp(0, 3, "foo", &read, &read_bl, balanced_read_flags));
++    ASSERT_EQ(bl.length(), read_bl.length());
++    ASSERT_EQ(0, memcmp(bl.c_str(), read_bl.c_str(), bl.length()));
++  }
++}
++
++TEST_P(LibRadosSplitOpPP, UnalignedBigRead) {
++  // One byte past three slices: a rounded-down chunk size produces a
++  // fourth chunk, which used to wrap the window fully around and attach
++  // two reads with a shared buffer to one sub-read.
++  bufferlist bl;
++  ASSERT_NO_FATAL_FAILURE(write_pattern_object(3, 1, &bl));
++
++  ObjectReadOperation read;
++  bufferlist read_bl;
++  read.read(0, bl.length(), NULL, NULL);
++  ASSERT_TRUE(AssertOperateWithSplitOp(0, 3, "foo", &read, &read_bl, balanced_read_flags));
++  ASSERT_EQ(bl.length(), read_bl.length());
++  ASSERT_EQ(0, memcmp(bl.c_str(), read_bl.c_str(), bl.length()));
++}
++
++TEST_P(LibRadosSplitOpPP, ShortReadInMultiOp) {
++  bufferlist bl;
++  ASSERT_NO_FATAL_FAILURE(write_pattern_object(2, 0, &bl));
++
++  // A read shorter than the minimum split size in the same request used
++  // to crash on a division by zero in init_read(), then on
++  // std::out_of_range in buffer assembly.
++  ObjectReadOperation read;
++  bufferlist big_bl, small_bl;
++  int big_rval, small_rval;
++  read.read(0, bl.length(), &big_bl, &big_rval);
++  read.read(0, 16, &small_bl, &small_rval);
++
++  bufferlist result_bl;
++  ASSERT_TRUE(AssertOperateWithSplitOp(0, 2, "foo", &read, &result_bl, balanced_read_flags));
++  ASSERT_EQ(0, big_rval);
++  ASSERT_EQ(0, small_rval);
++  ASSERT_EQ(bl.length(), big_bl.length());
++  ASSERT_EQ(0, memcmp(bl.c_str(), big_bl.c_str(), bl.length()));
++  ASSERT_EQ(16u, small_bl.length());
++  ASSERT_EQ(0, memcmp(bl.c_str(), small_bl.c_str(), 16));
++}
++
++TEST_P(LibRadosSplitOpPP, ShortSparseReadInMultiOp) {
++  bufferlist bl;
++  ASSERT_NO_FATAL_FAILURE(write_pattern_object(2, 0, &bl));
++
++  // Sparse variant of ShortReadInMultiOp: the short op only uses the
++  // reference sub-read, so sparse assembly must skip the others.
++  ObjectReadOperation read;
++  bufferlist big_bl, sparse_bl;
++  int big_rval, sparse_rval;
++  std::map<uint64_t, uint64_t> extents;
++  read.read(0, bl.length(), &big_bl, &big_rval);
++  read.sparse_read(0, 16, &extents, &sparse_bl, &sparse_rval);
++
++  bufferlist result_bl;
++  ASSERT_TRUE(AssertOperateWithSplitOp(0, 2, "foo", &read, &result_bl, balanced_read_flags));
++  ASSERT_EQ(0, big_rval);
++  ASSERT_EQ(0, sparse_rval);
++  ASSERT_EQ(bl.length(), big_bl.length());
++  ASSERT_EQ(0, memcmp(bl.c_str(), big_bl.c_str(), bl.length()));
++  ASSERT_EQ(1u, extents.size());
++  ASSERT_EQ(16u, sparse_bl.length());
++  ASSERT_EQ(0, memcmp(bl.c_str(), sparse_bl.c_str(), 16));
++}
++
+ TEST_P(LibRadosSplitOpECPP, ReadWithVersion) {
+   SKIP_IF_CRIMSON();
+   bufferlist bl;
+
+From 41a8751bc512514743cf134c70e2f2714935ba68 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Tue, 14 Jul 2026 04:06:50 -0700
+Subject: [PATCH 4/4] osdc: avoid divide-by-zero in prepare_single_op on
+ replicated pools
+
+stripe_width is 0 on a replicated pool, so chunk_size becomes 0 and the
+read offset is divided by it. Replicas hold the whole object and there
+is no shard to pin, so return early and let _op_submit() pick the
+target.
+
+create() clears BALANCE_READS and pins pgid, and _calc_target()
+short-circuits once pgid is set, so restore the target on every path
+that gives up on the split.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/osdc/SplitOp.cc               | 16 ++++++++++++++--
+ src/test/librados/split_op_cxx.cc | 25 +++++++++++++++++++++++++
+ 2 files changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/src/osdc/SplitOp.cc b/src/osdc/SplitOp.cc
+index a32ee9dbd7fa..f33a9fab257f 100644
+--- a/src/osdc/SplitOp.cc
++++ b/src/osdc/SplitOp.cc
+@@ -901,7 +901,14 @@ void SplitOp::prepare_single_op(Objecter::Op *op, Objecter &objecter, CephContex
+   const pg_pool_t *pi = objecter.osdmap->get_pg_pool(target.base_oloc.pool);
+   ceph_assert(pi);
+ 
++  // No shard to pin on a replicated pool; _op_submit() computes the target.
++  if (!pi->is_erasure()) {
++    debug_op_summary("reuse_op:", op, cct);
++    return;
++  }
++
+   objecter._calc_target(&op->target, op);
++
+   uint64_t data_chunk_count = pi->get_ec_data_shard_count();
+   uint32_t chunk_size = pi->get_stripe_width() / data_chunk_count;
+ 
+@@ -1015,7 +1022,9 @@ bool SplitOp::create(Objecter::Op *op, Objecter &objecter,
+     return false;
+   }
+ 
+-  // Populate the target, to extract the acting set from it.
++  // Populate the target, to extract the acting set from it. _calc_target()
++  // short-circuits once pgid is set.
++  const auto saved_target = target;
+   target.flags &= ~CEPH_OSD_FLAG_BALANCE_READS;
+   objecter._calc_target(&op->target, op);
+ 
+@@ -1025,9 +1034,10 @@ bool SplitOp::create(Objecter::Op *op, Objecter &objecter,
+   if (split_read->reference_sub_read == -1) {
+     split_read->abort = true;
+   }
+-  
++
+   if (split_read->abort) {
+     ldout(cct, DBG_LVL) << __func__ <<" ABORTED after init_reference_sub_read" << dendl;
++    target = saved_target;
+     return false;
+   }
+ 
+@@ -1042,6 +1052,7 @@ bool SplitOp::create(Objecter::Op *op, Objecter &objecter,
+   // STAGE 5: Final abort check - discard split op if problems were detected
+   if (split_read->abort) {
+     ldout(cct, DBG_LVL) << __func__ <<" ABORTED 2" << dendl;
++    target = saved_target;
+     return false;
+   }
+ 
+@@ -1049,6 +1060,7 @@ bool SplitOp::create(Objecter::Op *op, Objecter &objecter,
+   // fails, then this will catch the cases (albeit less efficiently).
+   if (split_read->sub_reads.size() <= 1) {
+     ldout(cct, DBG_LVL) << __func__ <<" reusing original op - inefficient" << dendl;
++    target = saved_target;
+     prepare_single_op(op, objecter, cct);
+     split_read->abort = true; // Required for destructor.
+     return false;
+diff --git a/src/test/librados/split_op_cxx.cc b/src/test/librados/split_op_cxx.cc
+index ff4c3d829824..322b497144b0 100644
+--- a/src/test/librados/split_op_cxx.cc
++++ b/src/test/librados/split_op_cxx.cc
+@@ -169,6 +169,31 @@ TEST_P(LibRadosSplitOpPP, ReadTwoShards) {
+   }
+ }
+ 
++TEST_P(LibRadosSplitOpPP, SingleChunkAfterPageRoundup) {
++  if (!split_ops) {
++    GTEST_SKIP() << "Needs split_ops!";
++  }
++  ASSERT_EQ(0, cluster.conf_set("osd_min_split_replica_read_size", "1024"));
++
++  bufferlist bl = make_pattern_bl(2048);
++  ObjectWriteOperation write1;
++  write1.write(0, bl);
++  ASSERT_TRUE(AssertOperateWithoutSplitOp(0, "foo", &write1));
++  ASSERT_NO_FATAL_FAILURE(stabilize_pg_log(bl));
++
++  // validate() accepts 2048 (>= 2 * 1024), but chunk_size rounds up to 4096,
++  // so the read serves whole off one replica instead of splitting.
++  ObjectReadOperation read;
++  bufferlist read_bl;
++  read.read(0, bl.length(), NULL, NULL);
++  ASSERT_TRUE(AssertOperateWithoutSplitOp(0, "foo", &read, &read_bl,
++                                          balanced_read_flags));
++  ASSERT_TRUE(read_bl.contents_equal(bl));
++
++  // Restore what SetUp() installed; later /0 tests read this value.
++  ASSERT_EQ(0, cluster.conf_set("osd_min_split_replica_read_size", "262144"));
++}
++
+ TEST_P(LibRadosSplitOpPP, StatBeforeRead) {
+   // Read the osd_min_split_replica_read_size config value
+   std::string min_split_size_str;

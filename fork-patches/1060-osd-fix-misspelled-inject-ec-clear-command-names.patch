@@ -1,0 +1,32 @@
+From 28820ee33f41fd81d9c876539221dedbe327a8ae Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Thu, 25 Jun 2026 22:16:26 +0800
+Subject: [PATCH 3/7] osd: fix misspelled inject ec-clear command names
+
+Replicated-pool branch compared against 'injecteclear*err' (missing a
+'c'), so the ec-only guard never matched the real command names.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/osd/OSD.cc | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/osd/OSD.cc b/src/osd/OSD.cc
+index 5342dd95c4b..90dbe315086 100644
+--- a/src/osd/OSD.cc
++++ b/src/osd/OSD.cc
+@@ -6573,9 +6573,9 @@ void TestOpsSocketHook::test_ops(OSDService *service, ObjectStore *store,
+         }
+     } else {
+         if ((command == "injectecreaderr") ||
+-	    (command == "injecteclearreaderr") ||
++	    (command == "injectecclearreaderr") ||
+ 	    (command == "injectecwriteerr") ||
+-	    (command == "injecteclearwriteerr") ||
++	    (command == "injectecclearwriteerr") ||
+             (command == "injectparityread") ||
+             (command == "injectclearparityread")) {
+             ss << "Only supported on ec pool";
+-- 
+2.54.0
+

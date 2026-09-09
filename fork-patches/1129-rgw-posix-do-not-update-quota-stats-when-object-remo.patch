@@ -1,0 +1,37 @@
+From a137cf2aaba0c657fb074e36de9224223b7494bf Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Mon, 29 Jun 2026 19:43:11 -0700
+Subject: [PATCH] rgw/posix: do not update quota stats when object removal
+ fails
+
+delete_object() ignored the result of ent->remove() and always cleared
+the bucket cache entry, decremented quota usage, and returned success.
+A failed removal therefore left the object on disk while quota stats were
+decremented, corrupting accounting and hiding the error from callers.
+
+Check the removal result and return the error without touching stats.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/rgw/driver/posix/rgw_sal_posix.cc | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/rgw/driver/posix/rgw_sal_posix.cc b/src/rgw/driver/posix/rgw_sal_posix.cc
+index 75b6b95bee8..922079b06b9 100644
+--- a/src/rgw/driver/posix/rgw_sal_posix.cc
++++ b/src/rgw/driver/posix/rgw_sal_posix.cc
+@@ -3277,6 +3277,11 @@ int POSIXObject::delete_object(const DoutPrefixProvider* dpp,
+       return ret;
+   }
+   ret = ent->remove(dpp, y, /*delete_children=*/false, &del_result);
++  if (ret < 0) {
++    ldpp_dout(dpp, 0) << "ERROR: failed to remove object " << get_name()
++                      << ": " << ret << dendl;
++    return ret;
++  }
+ 
+   cls_rgw_obj_key key;
+   get_key().get_index_key(&key);
+-- 
+2.55.0
+

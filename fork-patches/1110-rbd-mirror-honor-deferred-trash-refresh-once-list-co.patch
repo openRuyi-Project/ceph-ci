@@ -1,0 +1,57 @@
+From 2951da72131160416a3d32d78da02d6f6247bec8 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Mon, 6 Jul 2026 19:06:00 -0700
+Subject: [PATCH 08/13] rbd-mirror: honor deferred trash refresh once list
+ completes
+
+schedule_trash_list() sets m_deferred_trash_list when a refresh is
+requested during an in-flight list, but nothing read it:
+handle_trash_list() cleared m_trash_list_in_progress without acting on it,
+so images trashed during a watch re-establishment window were never
+enqueued for deletion until an unrelated rewatch or restart.
+
+On the successful path, consume the flag and schedule a fresh refresh (the
+error path already retries).
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/tools/rbd_mirror/image_deleter/TrashWatcher.cc | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/tools/rbd_mirror/image_deleter/TrashWatcher.cc b/src/tools/rbd_mirror/image_deleter/TrashWatcher.cc
+index 9162e6ab237..c69de0f6706 100644
+--- a/src/tools/rbd_mirror/image_deleter/TrashWatcher.cc
++++ b/src/tools/rbd_mirror/image_deleter/TrashWatcher.cc
+@@ -276,6 +276,7 @@ void TrashWatcher<I>::handle_trash_list(int r) {
+   }
+ 
+   Context *on_init_finish = nullptr;
++  bool deferred_trash_list = false;
+   {
+     std::lock_guard locker{m_lock};
+     ceph_assert(m_trash_list_in_progress);
+@@ -297,6 +298,11 @@ void TrashWatcher<I>::handle_trash_list(int r) {
+     } else if (r < 0) {
+       m_trash_list_in_progress = false;
+     }
++
++    if (!m_trash_list_in_progress) {
++      // a refresh requested while this one was in flight was deferred
++      std::swap(deferred_trash_list, m_deferred_trash_list);
++    }
+   }
+ 
+   if (r >= 0 && images.size() == MAX_RETURN) {
+@@ -306,6 +312,9 @@ void TrashWatcher<I>::handle_trash_list(int r) {
+   } else if (r < 0 && r != -EBLOCKLISTED) {
+     derr << "failed to retrieve trash directory: " << cpp_strerror(r) << dendl;
+     schedule_trash_list(10);
++  } else if (r >= 0 && deferred_trash_list) {
++    dout(5) << "scheduling deferred trash refresh" << dendl;
++    schedule_trash_list(30);
+   }
+ 
+   m_async_op_tracker.finish_op();
+-- 
+2.55.0
+

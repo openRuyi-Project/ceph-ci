@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Wed, 22 Jul 2026 12:00:00 +0800
+Subject: [PATCH] test/mds: run unittest_mds_quiesce_db serially
+
+Several QuiesceDbTest cases assert that a state transition is observed
+within a tight wall-clock budget. ReleaseAwait wraps root1_state.wait()
+in timed_run(sec(0.1), ...) and expects the agent callback to fire
+within 100ms. That callback is driven by the quiesce db thread pushing
+the next agent map, so the 100ms budget only holds when the db thread
+(and the notified waiter) get scheduled promptly, which has implicitly
+assumed an unloaded machine since the tests were introduced.
+
+On a saturated -j63 ctest run the db thread or the waiter can be
+preempted past the budget, timed_run times out and the assertion fails
+although the state machine is correct (observed TestQuiesceDb.cc:1287
+ReleaseAwait, Actual: false). A single such preemption is enough; the
+window is ~101ms unloaded, so it sits right on the edge.
+
+Mark the test RUN_SERIAL so ctest runs it alone, restoring the
+premise. It takes ~10s, a negligible serial window for the suite. This
+mirrors the fix for unittest_throttle.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/test/mds/CMakeLists.txt | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/test/mds/CMakeLists.txt b/src/test/mds/CMakeLists.txt
+index 18ebb648e68..00000000000 100644
+--- a/src/test/mds/CMakeLists.txt
++++ b/src/test/mds/CMakeLists.txt
+@@ -21,6 +21,7 @@ target_link_libraries(unittest_mds_sessionfilter mds osdc ceph-common global ${B
+   $<TARGET_OBJECTS:unit-main>
+ )
+ add_ceph_unittest(unittest_mds_quiesce_db)
++set_property(TEST unittest_mds_quiesce_db PROPERTY RUN_SERIAL TRUE)
+ target_link_libraries(unittest_mds_quiesce_db ceph-common global Boost::url)
+
+ # unittest_mds_quiesce_agent

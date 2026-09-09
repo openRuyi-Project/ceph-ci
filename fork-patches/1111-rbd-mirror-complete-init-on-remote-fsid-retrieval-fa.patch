@@ -1,0 +1,35 @@
+From ce8559cc6f7627122d595f6dc184cb7fd07edfab Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Mon, 6 Jul 2026 19:06:25 -0700
+Subject: [PATCH 09/13] rbd-mirror: complete init on remote fsid retrieval
+ failure
+
+snapshot::Replayer::init() returned bare on cluster_fsid() failure without
+completing on_finish or advancing m_state: the replayer hangs in starting,
+the context leaks, and a later shut_down() trips
+ceph_assert(m_state != STATE_INIT).
+
+Complete on_finish and set STATE_COMPLETE, as the following remote pool
+meta failure path already does.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/tools/rbd_mirror/image_replayer/snapshot/Replayer.cc | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/tools/rbd_mirror/image_replayer/snapshot/Replayer.cc b/src/tools/rbd_mirror/image_replayer/snapshot/Replayer.cc
+index 10167185d4a..58d6550fc94 100644
+--- a/src/tools/rbd_mirror/image_replayer/snapshot/Replayer.cc
++++ b/src/tools/rbd_mirror/image_replayer/snapshot/Replayer.cc
+@@ -158,6 +158,8 @@ void Replayer<I>::init(Context* on_finish) {
+   if (r < 0) {
+     derr << "failed to retrieve remote cluster fsid: " << cpp_strerror(r)
+ 	 << dendl;
++    m_state = STATE_COMPLETE;
++    m_threads->work_queue->queue(on_finish, r);
+     return;
+   }
+ 
+-- 
+2.55.0
+

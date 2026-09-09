@@ -1,0 +1,4099 @@
+From 86a80abc5fd05c4959cd3b35ff59c39a0d0f72cd Mon Sep 17 00:00:00 2001
+From: Ilya Dryomov <idryomov@gmail.com>
+Date: Sat, 20 Jun 2026 21:19:18 +0200
+Subject: [PATCH 1/3] open_image fix
+
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+---
+ src/test/librbd/test_fixture.cc | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/test/librbd/test_fixture.cc b/src/test/librbd/test_fixture.cc
+index 29d77b40f391..5aa85715e42a 100644
+--- a/src/test/librbd/test_fixture.cc
++++ b/src/test/librbd/test_fixture.cc
+@@ -83,9 +83,15 @@ void TestFixture::TearDown() {
+ int TestFixture::open_image(const std::string &image_name,
+ 			    librbd::ImageCtx **ictx) {
+   *ictx = new librbd::ImageCtx(image_name.c_str(), "", nullptr, m_ioctx, false);
+-  m_ictxs.insert(*ictx);
+ 
+-  return (*ictx)->state->open(0);
++  int r = (*ictx)->state->open(0);
++  if (r != 0) {
++    *ictx = nullptr;
++    return r;
++  }
++
++  m_ictxs.insert(*ictx);
++  return 0;
+ }
+ 
+ int TestFixture::snap_create(librbd::ImageCtx &ictx,
+
+From 5836184d9be208534cf677aa591fb0c069732392 Mon Sep 17 00:00:00 2001
+From: Ilya Dryomov <idryomov@gmail.com>
+Date: Sat, 20 Jun 2026 10:53:36 +0200
+Subject: [PATCH 2/3] internal api + test_Encryption.cc
+
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+---
+ src/librbd/api/Image.cc                       |    4 +-
+ src/librbd/api/Image.h                        |    2 +-
+ src/librbd/crypto/EncryptionFormat.h          |    3 +-
+ src/librbd/crypto/FormatRequest.cc            |    5 +-
+ src/librbd/crypto/FormatRequest.h             |   10 +-
+ .../crypto/luks/LUKSEncryptionFormat.cc       |   13 +-
+ src/librbd/crypto/luks/LUKSEncryptionFormat.h |    9 +-
+ src/librbd/librbd.cc                          |    4 +-
+ src/test/librbd/CMakeLists.txt                |    1 +
+ .../librbd/crypto/test_mock_FormatRequest.cc  |   37 +-
+ .../librbd/mock/crypto/MockEncryptionFormat.h |    2 +-
+ .../test_mock_SnapshotRemoveRequest.cc        |    6 +-
+ src/test/librbd/test_Encryption.cc            | 1135 ++++++++++++++
+ src/test/librbd/test_fixture.cc               |    8 +-
+ src/test/librbd/test_fixture.h                |    4 +-
+ src/test/librbd/test_librbd.cc                | 1335 -----------------
+ src/test/librbd/test_main.cc                  |    2 +
+ src/test/librbd/test_support.cc               |    6 +-
+ src/test/librbd/test_support.h                |    2 +
+ 19 files changed, 1213 insertions(+), 1375 deletions(-)
+ create mode 100644 src/test/librbd/test_Encryption.cc
+
+diff --git a/src/librbd/api/Image.cc b/src/librbd/api/Image.cc
+index bc2d523a1ac9..bbd6fcd636ed 100644
+--- a/src/librbd/api/Image.cc
++++ b/src/librbd/api/Image.cc
+@@ -971,7 +971,7 @@ int Image<I>::flatten_children(I *ictx, const char* snap_name,
+ template <typename I>
+ int Image<I>::encryption_format(I* ictx, encryption_format_t format,
+                                 encryption_options_t opts, size_t opts_size,
+-                                bool c_api) {
++                                bool insecure_fast_mode, bool c_api) {
+   crypto::EncryptionFormat<I>* result_format;
+   auto r = util::create_encryption_format(
+           ictx->cct, format, opts, opts_size, c_api, &result_format);
+@@ -982,7 +982,7 @@ int Image<I>::encryption_format(I* ictx, encryption_format_t format,
+   C_SaferCond cond;
+   auto req = librbd::crypto::FormatRequest<I>::create(
+           ictx, std::unique_ptr<crypto::EncryptionFormat<I>>(result_format),
+-          &cond);
++          insecure_fast_mode, &cond);
+   req->send();
+   return cond.wait();
+ }
+diff --git a/src/librbd/api/Image.h b/src/librbd/api/Image.h
+index 6dea1411f04c..b0a2c680d5a7 100644
+--- a/src/librbd/api/Image.h
++++ b/src/librbd/api/Image.h
+@@ -72,7 +72,7 @@ struct Image {
+ 
+   static int encryption_format(ImageCtxT *ictx, encryption_format_t format,
+                                encryption_options_t opts, size_t opts_size,
+-                               bool c_api);
++                               bool insecure_fast_mode, bool c_api);
+   static int encryption_load(ImageCtxT *ictx, const encryption_spec_t *specs,
+                              size_t spec_count, bool c_api);
+ };
+diff --git a/src/librbd/crypto/EncryptionFormat.h b/src/librbd/crypto/EncryptionFormat.h
+index cb6528538742..b9dd6d72c6bf 100644
+--- a/src/librbd/crypto/EncryptionFormat.h
++++ b/src/librbd/crypto/EncryptionFormat.h
+@@ -19,7 +19,8 @@ struct EncryptionFormat {
+   }
+ 
+   virtual std::unique_ptr<EncryptionFormat<ImageCtxT>> clone() const = 0;
+-  virtual void format(ImageCtxT* ictx, Context* on_finish) = 0;
++  virtual void format(ImageCtxT* ictx, bool insecure_fast_mode,
++                      Context* on_finish) = 0;
+   virtual void load(ImageCtxT* ictx, std::string* detected_format_name,
+                     Context* on_finish) = 0;
+   virtual void flatten(ImageCtxT* ictx, Context* on_finish) = 0;
+diff --git a/src/librbd/crypto/FormatRequest.cc b/src/librbd/crypto/FormatRequest.cc
+index b2b2d0416623..84f191069ce4 100644
+--- a/src/librbd/crypto/FormatRequest.cc
++++ b/src/librbd/crypto/FormatRequest.cc
+@@ -27,9 +27,10 @@ using librbd::util::create_context_callback;
+ 
+ template <typename I>
+ FormatRequest<I>::FormatRequest(
+-        I* image_ctx, EncryptionFormat format,
++        I* image_ctx, EncryptionFormat format, bool insecure_fast_mode,
+         Context* on_finish) : m_image_ctx(image_ctx),
+                               m_format(std::move(format)),
++                              m_insecure_fast_mode(insecure_fast_mode),
+                               m_on_finish(on_finish) {
+ }
+ 
+@@ -76,7 +77,7 @@ template <typename I>
+ void FormatRequest<I>::format() {
+   auto ctx = create_context_callback<
+           FormatRequest<I>, &FormatRequest<I>::handle_format>(this);
+-  m_format->format(m_image_ctx, ctx);
++  m_format->format(m_image_ctx, m_insecure_fast_mode, ctx);
+ }
+ 
+ template <typename I>
+diff --git a/src/librbd/crypto/FormatRequest.h b/src/librbd/crypto/FormatRequest.h
+index 4065827e6640..0f4532b73348 100644
+--- a/src/librbd/crypto/FormatRequest.h
++++ b/src/librbd/crypto/FormatRequest.h
+@@ -21,11 +21,14 @@ class FormatRequest {
+     using EncryptionFormat = decltype(I::encryption_format);
+ 
+     static FormatRequest* create(
+-            I* image_ctx, EncryptionFormat format, Context* on_finish) {
+-      return new FormatRequest(image_ctx, std::move(format), on_finish);
++            I* image_ctx, EncryptionFormat format, bool insecure_fast_mode,
++            Context* on_finish) {
++      return new FormatRequest(image_ctx, std::move(format),
++                               insecure_fast_mode, on_finish);
+     }
+ 
+-    FormatRequest(I* image_ctx, EncryptionFormat format, Context* on_finish);
++    FormatRequest(I* image_ctx, EncryptionFormat format,
++                  bool insecure_fast_mode, Context* on_finish);
+     void send();
+     void handle_shutdown_crypto(int r);
+     void format();
+@@ -38,6 +41,7 @@ class FormatRequest {
+     I* m_image_ctx;
+ 
+     EncryptionFormat m_format;
++    bool m_insecure_fast_mode;
+     Context* m_on_finish;
+ };
+ 
+diff --git a/src/librbd/crypto/luks/LUKSEncryptionFormat.cc b/src/librbd/crypto/luks/LUKSEncryptionFormat.cc
+index 23d3b6e1ca68..ffd2d9d0b311 100644
+--- a/src/librbd/crypto/luks/LUKSEncryptionFormat.cc
++++ b/src/librbd/crypto/luks/LUKSEncryptionFormat.cc
+@@ -25,7 +25,8 @@ void EncryptionFormat<I>::flatten(I* image_ctx, Context* on_finish) {
+ }
+ 
+ template <typename I>
+-void LUKSEncryptionFormat<I>::format(I* image_ctx, Context* on_finish) {
++void LUKSEncryptionFormat<I>::format(I* image_ctx, bool insecure_fast_mode,
++                                     Context* on_finish) {
+   lderr(image_ctx->cct) << "explicit LUKS version required for format" << dendl;
+   on_finish->complete(-EINVAL);
+ }
+@@ -41,10 +42,11 @@ void LUKSEncryptionFormat<I>::load(I* image_ctx,
+ }
+ 
+ template <typename I>
+-void LUKS1EncryptionFormat<I>::format(I* image_ctx, Context* on_finish) {
++void LUKS1EncryptionFormat<I>::format(I* image_ctx, bool insecure_fast_mode,
++                                      Context* on_finish) {
+   auto req = luks::FormatRequest<I>::create(
+       image_ctx, RBD_ENCRYPTION_FORMAT_LUKS1, m_alg, m_passphrase,
+-      &this->m_crypto, on_finish, false);
++      &this->m_crypto, on_finish, insecure_fast_mode);
+   req->send();
+ }
+ 
+@@ -59,10 +61,11 @@ void LUKS1EncryptionFormat<I>::load(I* image_ctx,
+ }
+ 
+ template <typename I>
+-void LUKS2EncryptionFormat<I>::format(I* image_ctx, Context* on_finish) {
++void LUKS2EncryptionFormat<I>::format(I* image_ctx, bool insecure_fast_mode,
++                                      Context* on_finish) {
+   auto req = luks::FormatRequest<I>::create(
+       image_ctx, RBD_ENCRYPTION_FORMAT_LUKS2, m_alg, m_passphrase,
+-      &this->m_crypto, on_finish, false);
++      &this->m_crypto, on_finish, insecure_fast_mode);
+   req->send();
+ }
+ 
+diff --git a/src/librbd/crypto/luks/LUKSEncryptionFormat.h b/src/librbd/crypto/luks/LUKSEncryptionFormat.h
+index 5883f9500a0f..63bf4d3fd8db 100644
+--- a/src/librbd/crypto/luks/LUKSEncryptionFormat.h
++++ b/src/librbd/crypto/luks/LUKSEncryptionFormat.h
+@@ -40,7 +40,8 @@ class LUKSEncryptionFormat : public EncryptionFormat<ImageCtxT> {
+     return std::make_unique<LUKSEncryptionFormat>(m_passphrase);
+   }
+ 
+-  void format(ImageCtxT* ictx, Context* on_finish) override;
++  void format(ImageCtxT* ictx, bool insecure_fast_mode,
++              Context* on_finish) override;
+   void load(ImageCtxT* ictx, std::string* detected_format_name,
+             Context* on_finish) override;
+ 
+@@ -58,7 +59,8 @@ class LUKS1EncryptionFormat : public EncryptionFormat<ImageCtxT> {
+     return std::make_unique<LUKS1EncryptionFormat>(m_alg, m_passphrase);
+   }
+ 
+-  void format(ImageCtxT* ictx, Context* on_finish) override;
++  void format(ImageCtxT* ictx, bool insecure_fast_mode,
++              Context* on_finish) override;
+   void load(ImageCtxT* ictx, std::string* detected_format_name,
+             Context* on_finish) override;
+ 
+@@ -77,7 +79,8 @@ class LUKS2EncryptionFormat : public EncryptionFormat<ImageCtxT> {
+     return std::make_unique<LUKS2EncryptionFormat>(m_alg, m_passphrase);
+   }
+ 
+-  void format(ImageCtxT* ictx, Context* on_finish) override;
++  void format(ImageCtxT* ictx, bool insecure_fast_mode,
++              Context* on_finish) override;
+   void load(ImageCtxT* ictx, std::string* detected_format_name,
+             Context* on_finish) override;
+ 
+diff --git a/src/librbd/librbd.cc b/src/librbd/librbd.cc
+index fac2c5a29497..0dc1c20f75ac 100644
+--- a/src/librbd/librbd.cc
++++ b/src/librbd/librbd.cc
+@@ -2187,7 +2187,7 @@ namespace librbd {
+   {
+     ImageCtx *ictx = (ImageCtx *)ctx;
+     return librbd::api::Image<>::encryption_format(
+-            ictx, format, opts, opts_size, false);
++            ictx, format, opts, opts_size, false, false);
+   }
+ 
+   int Image::encryption_load(encryption_format_t format,
+@@ -4573,7 +4573,7 @@ extern "C" int rbd_encryption_format(rbd_image_t image,
+ {
+   librbd::ImageCtx *ictx = (librbd::ImageCtx *)image;
+   return librbd::api::Image<>::encryption_format(
+-          ictx, format, opts, opts_size, true);
++          ictx, format, opts, opts_size, false, true);
+ }
+ 
+ extern "C" int rbd_encryption_load(rbd_image_t image,
+diff --git a/src/test/librbd/CMakeLists.txt b/src/test/librbd/CMakeLists.txt
+index 6b3d8c2681c6..f93d6d34a13c 100644
+--- a/src/test/librbd/CMakeLists.txt
++++ b/src/test/librbd/CMakeLists.txt
+@@ -12,6 +12,7 @@ set(librbd_test
+   test_internal.cc
+   test_mirroring.cc
+   test_DeepCopy.cc
++  test_Encryption.cc
+   test_Groups.cc
+   test_Migration.cc
+   test_MirroringWatcher.cc
+diff --git a/src/test/librbd/crypto/test_mock_FormatRequest.cc b/src/test/librbd/crypto/test_mock_FormatRequest.cc
+index 516f7d2a41e5..58c848f2a841 100644
+--- a/src/test/librbd/crypto/test_mock_FormatRequest.cc
++++ b/src/test/librbd/crypto/test_mock_FormatRequest.cc
+@@ -99,7 +99,7 @@ struct TestMockCryptoFormatRequest : public TestMockFixture {
+     mock_image_ctx->encryption_format.reset(old_encryption_format);
+     mock_format_request = MockFormatRequest::create(
+           mock_image_ctx,
+-          std::unique_ptr<MockEncryptionFormat>(new_encryption_format),
++          std::unique_ptr<MockEncryptionFormat>(new_encryption_format), false,
+           on_finish);
+   }
+ 
+@@ -124,10 +124,10 @@ struct TestMockCryptoFormatRequest : public TestMockFixture {
+     }));
+   }
+ 
+-  void expect_encryption_format() {
++  void expect_encryption_format(bool insecure_fast_mode) {
+     EXPECT_CALL(*new_encryption_format, format(
+-            mock_image_ctx, _)).WillOnce(
+-                    WithArg<1>(Invoke([this](Context* ctx) {
++            mock_image_ctx, insecure_fast_mode, _)).WillOnce(
++                    WithArg<2>(Invoke([this](Context* ctx) {
+                       format_context = ctx;
+     })));
+   }
+@@ -163,7 +163,7 @@ TEST_F(TestMockCryptoFormatRequest, FailShutDownCrypto) {
+ TEST_F(TestMockCryptoFormatRequest, FormatFail) {
+   mock_image_ctx->encryption_format = nullptr;
+   expect_test_journal_feature(false);
+-  expect_encryption_format();
++  expect_encryption_format(false);
+   mock_format_request->send();
+   ASSERT_EQ(ETIMEDOUT, finished_cond.wait_for(0));
+   format_context->complete(-EIO);
+@@ -174,7 +174,26 @@ TEST_F(TestMockCryptoFormatRequest, FormatFail) {
+ TEST_F(TestMockCryptoFormatRequest, Success) {
+   mock_image_ctx->encryption_format = nullptr;
+   expect_test_journal_feature(false);
+-  expect_encryption_format();
++  expect_encryption_format(false);
++  mock_format_request->send();
++  ASSERT_EQ(ETIMEDOUT, finished_cond.wait_for(0));
++  expect_image_flush(0);
++  format_context->complete(0);
++  ASSERT_EQ(0, finished_cond.wait());
++  ASSERT_EQ(new_encryption_format, mock_image_ctx->encryption_format.get());
++}
++
++TEST_F(TestMockCryptoFormatRequest, SuccessInsecureFast) {
++  delete mock_format_request;
++  new_encryption_format = new MockEncryptionFormat();
++  mock_format_request = MockFormatRequest::create(
++        mock_image_ctx,
++        std::unique_ptr<MockEncryptionFormat>(new_encryption_format), true,
++        on_finish);
++
++  mock_image_ctx->encryption_format = nullptr;
++  expect_test_journal_feature(false);
++  expect_encryption_format(true);
+   mock_format_request->send();
+   ASSERT_EQ(ETIMEDOUT, finished_cond.wait_for(0));
+   expect_image_flush(0);
+@@ -186,7 +205,7 @@ TEST_F(TestMockCryptoFormatRequest, Success) {
+ TEST_F(TestMockCryptoFormatRequest, FailFlush) {
+   expect_test_journal_feature(false);
+   expect_shutdown_crypto();
+-  expect_encryption_format();
++  expect_encryption_format(false);
+   mock_format_request->send();
+   ASSERT_EQ(ETIMEDOUT, finished_cond.wait_for(0));
+   expect_image_flush(-EIO);
+@@ -198,7 +217,7 @@ TEST_F(TestMockCryptoFormatRequest, FailFlush) {
+ TEST_F(TestMockCryptoFormatRequest, CryptoAlreadyLoaded) {
+   expect_test_journal_feature(false);
+   expect_shutdown_crypto();
+-  expect_encryption_format();
++  expect_encryption_format(false);
+   mock_format_request->send();
+   ASSERT_EQ(ETIMEDOUT, finished_cond.wait_for(0));
+   expect_image_flush(0);
+@@ -211,7 +230,7 @@ TEST_F(TestMockCryptoFormatRequest, ThinFormat) {
+   mock_image_ctx->encryption_format = nullptr;
+   mock_image_ctx->parent = mock_parent_image_ctx;
+   expect_test_journal_feature(false);
+-  expect_encryption_format();
++  expect_encryption_format(false);
+   mock_format_request->send();
+   ASSERT_EQ(ETIMEDOUT, finished_cond.wait_for(0));
+   expect_image_flush(0);
+diff --git a/src/test/librbd/mock/crypto/MockEncryptionFormat.h b/src/test/librbd/mock/crypto/MockEncryptionFormat.h
+index acd4f9f98e87..40e8eabcfb09 100644
+--- a/src/test/librbd/mock/crypto/MockEncryptionFormat.h
++++ b/src/test/librbd/mock/crypto/MockEncryptionFormat.h
+@@ -14,7 +14,7 @@ namespace crypto {
+ 
+ struct MockEncryptionFormat {
+   MOCK_CONST_METHOD0(clone, std::unique_ptr<MockEncryptionFormat>());
+-  MOCK_METHOD2(format, void(MockImageCtx*, Context*));
++  MOCK_METHOD3(format, void(MockImageCtx*, bool, Context*));
+   MOCK_METHOD3(load, void(MockImageCtx*, std::string*, Context*));
+   MOCK_METHOD2(flatten, void(MockImageCtx*, Context*));
+   MOCK_METHOD0(get_crypto, MockCryptoInterface*());
+diff --git a/src/test/librbd/operation/test_mock_SnapshotRemoveRequest.cc b/src/test/librbd/operation/test_mock_SnapshotRemoveRequest.cc
+index ef192860a9b2..ebf3966737df 100644
+--- a/src/test/librbd/operation/test_mock_SnapshotRemoveRequest.cc
++++ b/src/test/librbd/operation/test_mock_SnapshotRemoveRequest.cc
+@@ -395,8 +395,7 @@ TEST_F(TestMockOperationSnapshotRemoveRequest, FlattenedCloneRemovesChild) {
+   ASSERT_EQ(0, open_image(clone_name, &ictx));
+   ASSERT_EQ(0, snap_create(*ictx, "snap1"));
+ 
+-  librbd::NoOpProgressContext prog_ctx;
+-  ASSERT_EQ(0, flatten(*ictx, prog_ctx));
++  ASSERT_EQ(0, flatten(ictx));
+   ASSERT_EQ(0, ictx->state->refresh_if_required());
+ 
+   MockImageCtx mock_image_ctx(*ictx);
+@@ -779,8 +778,7 @@ TEST_F(TestMockOperationSnapshotRemoveRequest, RemoveChildError) {
+ 
+   ASSERT_EQ(0, snap_create(*ictx, "snap1"));
+ 
+-  librbd::NoOpProgressContext prog_ctx;
+-  ASSERT_EQ(0, flatten(*ictx, prog_ctx));
++  ASSERT_EQ(0, flatten(ictx));
+   ASSERT_EQ(0, ictx->state->refresh_if_required());
+ 
+   MockImageCtx mock_image_ctx(*ictx);
+diff --git a/src/test/librbd/test_Encryption.cc b/src/test/librbd/test_Encryption.cc
+new file mode 100644
+index 000000000000..26d93879afd4
+--- /dev/null
++++ b/src/test/librbd/test_Encryption.cc
+@@ -0,0 +1,1135 @@
++// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
++// vim: ts=8 sw=2 sts=2 expandtab
++
++#include "include/rbd/librbd.h"
++#include "test/librbd/test_fixture.h"
++#include "test/librbd/test_support.h"
++#include "librbd/api/Image.h"
++#include "librbd/api/Io.h"
++#include "librbd/internal.h"
++#include "librbd/io/ReadResult.h"
++
++void register_test_encryption() {
++}
++
++#ifdef HAVE_LIBCRYPTSETUP
++
++class TestEncryption : public TestFixture {
++public:
++  static int format(librbd::ImageCtx* ictx, librbd::encryption_format_t format,
++                    librbd::encryption_options_t opts, size_t opts_size,
++                    bool c_api = false) {
++    // format with insecure_fast_mode=true to save time and CPU cycles
++    return librbd::api::Image<>::encryption_format(ictx, format, opts,
++                                                   opts_size, true, c_api);
++  }
++
++  static int load(librbd::ImageCtx* ictx, librbd::encryption_format_t format,
++                  librbd::encryption_options_t opts, size_t opts_size) {
++    librbd::encryption_spec_t spec = {format, opts, opts_size};
++    return load(ictx, &spec, 1);
++  }
++
++  static int load(librbd::ImageCtx* ictx,
++                  const librbd::encryption_spec_t* specs, size_t spec_count) {
++    return librbd::api::Image<>::encryption_load(ictx, specs, spec_count,
++                                                 false);
++  }
++
++  void clone_image(librbd::ImageCtx* parent_ictx,
++                   const std::string& parent_snap_name,
++                   const std::string& clone_name) {
++    ASSERT_EQ(0, snap_create(*parent_ictx, parent_snap_name));
++    ASSERT_EQ(0, snap_protect(*parent_ictx, parent_snap_name));
++
++    librbd::ImageOptions opts;
++    ASSERT_EQ(0, m_rbd.clone3(m_ioctx, parent_ictx->name.c_str(),
++                              parent_snap_name.c_str(), m_ioctx,
++                              clone_name.c_str(), opts));
++  }
++};
++
++TEST_F(TestEncryption, BasicClone)
++{
++  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
++
++  rados_ioctx_t ioctx;
++  rados_ioctx_create(_cluster, _pool_name.c_str(), &ioctx);
++
++  // create base image, write 'a's
++  std::string name = get_temp_image_name();
++  ASSERT_EQ(0, create_image_pp(m_rbd, m_ioctx, name, 256 << 20));
++
++  rbd_image_t image;
++  ASSERT_EQ(0, rbd_open(ioctx, name.c_str(), &image, NULL));
++  ASSERT_EQ(4, rbd_write(image, 0, 4, "aaaa"));
++  ASSERT_EQ(0, rbd_flush(image));
++
++  // clone, encrypt with LUKS1, write 'b's
++  std::string child1_name = get_temp_image_name();
++  ASSERT_NO_FATAL_FAILURE(clone_image(static_cast<librbd::ImageCtx*>(image),
++                                      "snap", child1_name));
++
++  rbd_image_t child1;
++  ASSERT_EQ(0, rbd_open(ioctx, child1_name.c_str(), &child1, NULL));
++  rbd_encryption_luks1_format_options_t child1_opts = {
++          .alg = RBD_ENCRYPTION_ALGORITHM_AES256,
++          .passphrase = "password",
++          .passphrase_size = 8,
++  };
++  ASSERT_EQ(-EINVAL, rbd_encryption_load(
++          child1, RBD_ENCRYPTION_FORMAT_LUKS1, &child1_opts,
++          sizeof(child1_opts)));
++  ASSERT_EQ(0, format(static_cast<librbd::ImageCtx*>(child1),
++                      RBD_ENCRYPTION_FORMAT_LUKS1, &child1_opts,
++                      sizeof(child1_opts), true));
++  ASSERT_EQ(0, rbd_encryption_load(
++          child1, RBD_ENCRYPTION_FORMAT_LUKS1, &child1_opts,
++          sizeof(child1_opts)));
++  ASSERT_EQ(4, rbd_write(child1, 64 << 20, 4, "bbbb"));
++  ASSERT_EQ(0, rbd_flush(child1));
++
++  // clone, encrypt with LUKS2 (same passphrase), write 'c's
++  std::string child2_name = get_temp_image_name();
++  ASSERT_NO_FATAL_FAILURE(clone_image(static_cast<librbd::ImageCtx*>(child1),
++                                      "snap", child2_name));
++
++  rbd_image_t child2;
++  ASSERT_EQ(0, rbd_open(ioctx, child2_name.c_str(), &child2, NULL));
++  rbd_encryption_luks2_format_options_t child2_opts = {
++          .alg = RBD_ENCRYPTION_ALGORITHM_AES256,
++          .passphrase = "password",
++          .passphrase_size = 8,
++  };
++  ASSERT_EQ(0, format(static_cast<librbd::ImageCtx*>(child2),
++                      RBD_ENCRYPTION_FORMAT_LUKS2, &child2_opts,
++                      sizeof(child2_opts), true));
++  rbd_encryption_luks_format_options_t child2_lopts = {
++          .passphrase = "password",
++          .passphrase_size = 8,
++  };
++  ASSERT_EQ(0, rbd_encryption_load(
++          child2, RBD_ENCRYPTION_FORMAT_LUKS, &child2_lopts,
++          sizeof(child2_lopts)));
++  ASSERT_EQ(4, rbd_write(child2, 128 << 20, 4, "cccc"));
++  ASSERT_EQ(0, rbd_flush(child2));
++
++  // clone, encrypt with LUKS2 (different passphrase)
++  std::string child3_name = get_temp_image_name();
++  ASSERT_NO_FATAL_FAILURE(clone_image(static_cast<librbd::ImageCtx*>(child2),
++                                      "snap", child3_name));
++
++  rbd_image_t child3;
++  ASSERT_EQ(0, rbd_open(ioctx, child3_name.c_str(), &child3, NULL));
++  rbd_encryption_luks2_format_options_t child3_opts = {
++          .alg = RBD_ENCRYPTION_ALGORITHM_AES256,
++          .passphrase = "12345678",
++          .passphrase_size = 8,
++  };
++  ASSERT_EQ(0, format(static_cast<librbd::ImageCtx*>(child3),
++                      RBD_ENCRYPTION_FORMAT_LUKS2, &child3_opts,
++                      sizeof(child3_opts), true));
++  ASSERT_EQ(-EPERM, rbd_encryption_load(
++        child3, RBD_ENCRYPTION_FORMAT_LUKS2, &child3_opts,
++        sizeof(child3_opts)));
++
++  // verify child3 data
++  rbd_encryption_spec_t specs[] = {
++          { .format = RBD_ENCRYPTION_FORMAT_LUKS2,
++            .opts = &child3_opts,
++            .opts_size = sizeof(child3_opts)},
++          { .format = RBD_ENCRYPTION_FORMAT_LUKS2,
++            .opts = &child2_opts,
++            .opts_size = sizeof(child2_opts)},
++          { .format = RBD_ENCRYPTION_FORMAT_LUKS1,
++            .opts = &child1_opts,
++            .opts_size = sizeof(child1_opts)}
++  };
++
++  ASSERT_EQ(0, rbd_encryption_load2(child3, specs, 3));
++
++  char read_data[5] = {0};
++  ASSERT_EQ(4, rbd_read(child3, 0, 4, read_data));
++  ASSERT_STREQ("aaaa", read_data);
++  ASSERT_EQ(4, rbd_read(child3, 64 << 20, 4, read_data));
++  ASSERT_STREQ("bbbb", read_data);
++  ASSERT_EQ(4, rbd_read(child3, 128 << 20, 4, read_data));
++  ASSERT_STREQ("cccc", read_data);
++
++  // clone without formatting
++  std::string child4_name = get_temp_image_name();
++  ASSERT_NO_FATAL_FAILURE(clone_image(static_cast<librbd::ImageCtx*>(child3),
++                                      "snap", child4_name));
++
++  rbd_image_t child4;
++  ASSERT_EQ(0, rbd_open(ioctx, child4_name.c_str(), &child4, NULL));
++  rbd_encryption_spec_t child4_specs[] = {
++          { .format = RBD_ENCRYPTION_FORMAT_LUKS2,
++            .opts = &child3_opts,
++            .opts_size = sizeof(child3_opts)},
++          { .format = RBD_ENCRYPTION_FORMAT_LUKS2,
++            .opts = &child3_opts,
++            .opts_size = sizeof(child3_opts)},
++          { .format = RBD_ENCRYPTION_FORMAT_LUKS2,
++            .opts = &child2_opts,
++            .opts_size = sizeof(child2_opts)},
++          { .format = RBD_ENCRYPTION_FORMAT_LUKS1,
++            .opts = &child1_opts,
++            .opts_size = sizeof(child1_opts)}
++  };
++
++  ASSERT_EQ(0, rbd_encryption_load2(child4, child4_specs, 4));
++
++  // flatten child4
++  ASSERT_EQ(0, rbd_flatten(child4));
++
++  // reopen child4 and load encryption
++  ASSERT_EQ(0, rbd_close(child4));
++  ASSERT_EQ(0, rbd_open(ioctx, child4_name.c_str(), &child4, NULL));
++  ASSERT_EQ(0, rbd_encryption_load(
++          child4, RBD_ENCRYPTION_FORMAT_LUKS2, &child3_opts,
++          sizeof(child3_opts)));
++
++  // verify flattend image
++  ASSERT_EQ(4, rbd_read(child4, 0, 4, read_data));
++  ASSERT_STREQ("aaaa", read_data);
++  ASSERT_EQ(4, rbd_read(child4, 64 << 20, 4, read_data));
++  ASSERT_STREQ("bbbb", read_data);
++  ASSERT_EQ(4, rbd_read(child4, 128 << 20, 4, read_data));
++  ASSERT_STREQ("cccc", read_data);
++
++  ASSERT_EQ(0, rbd_close(child4));
++  ASSERT_EQ(0, rbd_remove(ioctx, child4_name.c_str()));
++  ASSERT_EQ(0, rbd_snap_unprotect(child3, "snap"));
++  ASSERT_EQ(0, rbd_snap_remove(child3, "snap"));
++  ASSERT_EQ(0, rbd_close(child3));
++  ASSERT_EQ(0, rbd_remove(ioctx, child3_name.c_str()));
++  ASSERT_EQ(0, rbd_snap_unprotect(child2, "snap"));
++  ASSERT_EQ(0, rbd_snap_remove(child2, "snap"));
++  ASSERT_EQ(0, rbd_close(child2));
++  ASSERT_EQ(0, rbd_remove(ioctx, child2_name.c_str()));
++  ASSERT_EQ(0, rbd_snap_unprotect(child1, "snap"));
++  ASSERT_EQ(0, rbd_snap_remove(child1, "snap"));
++  ASSERT_EQ(0, rbd_close(child1));
++  ASSERT_EQ(0, rbd_remove(ioctx, child1_name.c_str()));
++  ASSERT_EQ(0, rbd_snap_unprotect(image, "snap"));
++  ASSERT_EQ(0, rbd_snap_remove(image, "snap"));
++  ASSERT_EQ(0, rbd_close(image));
++  ASSERT_EQ(0, rbd_remove(ioctx, name.c_str()));
++  rados_ioctx_destroy(ioctx);
++}
++
++TEST_F(TestEncryption, LUKS1UnderLUKS2WithoutResize)
++{
++  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
++
++  std::string parent_name = get_temp_image_name();
++  std::string clone_name = get_temp_image_name();
++  uint64_t data_size = 25 << 20;
++  uint64_t luks1_meta_size = 4 << 20;
++  uint64_t luks2_meta_size = 16 << 20;
++  std::string parent_passphrase = "parent passphrase";
++  std::string clone_passphrase = "clone passphrase";
++
++  ASSERT_EQ(0, create_image_pp(m_rbd, m_ioctx, parent_name,
++                               luks1_meta_size + data_size, 22));
++  librbd::ImageCtx* ictx;
++  ASSERT_EQ(0, open_image(parent_name, &ictx));
++  librbd::encryption_luks1_format_options_t luks1_opts = {
++      RBD_ENCRYPTION_ALGORITHM_AES256, parent_passphrase};
++  ASSERT_EQ(0, format(ictx, RBD_ENCRYPTION_FORMAT_LUKS1, &luks1_opts,
++                      sizeof(luks1_opts)));
++  ceph::bufferlist bl;
++  bl.append(std::string(data_size, 'a'));
++  ASSERT_EQ(static_cast<ssize_t>(data_size),
++            librbd::api::Io<>::write(*ictx, 0, data_size, std::move(bl), 0));
++  ASSERT_NO_FATAL_FAILURE(clone_image(ictx, "snap", clone_name));
++  close_image(ictx);
++
++  ASSERT_EQ(0, open_image(clone_name, &ictx));
++  librbd::encryption_luks2_format_options_t luks2_opts =
++      {RBD_ENCRYPTION_ALGORITHM_AES256, clone_passphrase};
++  ASSERT_EQ(0, format(ictx, RBD_ENCRYPTION_FORMAT_LUKS2, &luks2_opts,
++                      sizeof(luks2_opts)));
++  librbd::encryption_luks_format_options_t opts1 = {parent_passphrase};
++  librbd::encryption_luks_format_options_t opts2 = {clone_passphrase};
++  librbd::encryption_spec_t specs[] = {
++      {RBD_ENCRYPTION_FORMAT_LUKS, &opts2, sizeof(opts2)},
++      {RBD_ENCRYPTION_FORMAT_LUKS, &opts1, sizeof(opts1)}};
++  ASSERT_EQ(0, load(ictx, specs, std::size(specs)));
++  uint64_t size;
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  EXPECT_EQ(data_size + luks1_meta_size - luks2_meta_size, size);
++  uint64_t overlap;
++  ASSERT_EQ(0, librbd::get_overlap(ictx, &overlap));
++  EXPECT_EQ(data_size + luks1_meta_size - luks2_meta_size, overlap);
++  ceph::bufferlist expected_bl;
++  expected_bl.append(std::string(
++      data_size + luks1_meta_size - luks2_meta_size, 'a'));
++  ceph::bufferlist read_bl;
++  ASSERT_EQ(static_cast<ssize_t>(expected_bl.length()),
++            librbd::api::Io<>::read(*ictx, 0, expected_bl.length(),
++                                    librbd::io::ReadResult{&read_bl}, 0));
++  EXPECT_TRUE(expected_bl.contents_equal(read_bl));
++}
++
++TEST_F(TestEncryption, LUKS2UnderLUKS1WithoutResize)
++{
++  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
++
++  std::string parent_name = get_temp_image_name();
++  std::string clone_name = get_temp_image_name();
++  uint64_t data_size = 25 << 20;
++  uint64_t luks1_meta_size = 4 << 20;
++  uint64_t luks2_meta_size = 16 << 20;
++  std::string parent_passphrase = "parent passphrase";
++  std::string clone_passphrase = "clone passphrase";
++
++  ASSERT_EQ(0, create_image_pp(m_rbd, m_ioctx, parent_name,
++                               luks2_meta_size + data_size, 22));
++  librbd::ImageCtx* ictx;
++  ASSERT_EQ(0, open_image(parent_name, &ictx));
++  librbd::encryption_luks2_format_options_t luks2_opts = {
++      RBD_ENCRYPTION_ALGORITHM_AES256, parent_passphrase};
++  ASSERT_EQ(0, format(ictx, RBD_ENCRYPTION_FORMAT_LUKS2, &luks2_opts,
++                      sizeof(luks2_opts)));
++  ceph::bufferlist bl;
++  bl.append(std::string(data_size, 'a'));
++  ASSERT_EQ(static_cast<ssize_t>(data_size),
++            librbd::api::Io<>::write(*ictx, 0, data_size, std::move(bl), 0));
++  ASSERT_NO_FATAL_FAILURE(clone_image(ictx, "snap", clone_name));
++  close_image(ictx);
++
++  ASSERT_EQ(0, open_image(clone_name, &ictx));
++  librbd::encryption_luks1_format_options_t luks1_opts =
++      {RBD_ENCRYPTION_ALGORITHM_AES256, clone_passphrase};
++  ASSERT_EQ(0, format(ictx, RBD_ENCRYPTION_FORMAT_LUKS1, &luks1_opts,
++                      sizeof(luks1_opts)));
++  librbd::encryption_luks_format_options_t opts1 = {parent_passphrase};
++  librbd::encryption_luks_format_options_t opts2 = {clone_passphrase};
++  librbd::encryption_spec_t specs[] = {
++      {RBD_ENCRYPTION_FORMAT_LUKS, &opts2, sizeof(opts2)},
++      {RBD_ENCRYPTION_FORMAT_LUKS, &opts1, sizeof(opts1)}};
++  ASSERT_EQ(0, load(ictx, specs, std::size(specs)));
++  uint64_t size;
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  EXPECT_EQ(data_size + luks2_meta_size - luks1_meta_size, size);
++  uint64_t overlap;
++  ASSERT_EQ(0, librbd::get_overlap(ictx, &overlap));
++  EXPECT_EQ(data_size, overlap);
++  ceph::bufferlist expected_bl;
++  expected_bl.append(std::string(data_size, 'a'));
++  expected_bl.append_zero(luks2_meta_size - luks1_meta_size);
++  ceph::bufferlist read_bl;
++  ASSERT_EQ(static_cast<ssize_t>(expected_bl.length()),
++            librbd::api::Io<>::read(*ictx, 0, expected_bl.length(),
++                                    librbd::io::ReadResult{&read_bl}, 0));
++  EXPECT_TRUE(expected_bl.contents_equal(read_bl));
++}
++
++TEST_F(TestEncryption, EncryptionFormatNoData)
++{
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
++
++  std::string name = get_temp_image_name();
++  uint64_t luks1_meta_size = 4 << 20;
++  std::string passphrase = "some passphrase";
++
++  ASSERT_EQ(0, create_image_pp(m_rbd, m_ioctx, name, luks1_meta_size - 1, 22));
++  librbd::ImageCtx* ictx;
++  ASSERT_EQ(0, open_image(name, &ictx));
++  librbd::encryption_luks1_format_options_t fopts = {
++      RBD_ENCRYPTION_ALGORITHM_AES256, passphrase};
++  ASSERT_EQ(-ENOSPC, format(ictx, RBD_ENCRYPTION_FORMAT_LUKS1, &fopts,
++                            sizeof(fopts)));
++  uint64_t size;
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(luks1_meta_size - 1, size);
++  close_image(ictx);
++
++  ASSERT_EQ(0, open_image(name, &ictx));
++  ASSERT_EQ(0, resize(ictx, luks1_meta_size));
++  ASSERT_EQ(0, format(ictx, RBD_ENCRYPTION_FORMAT_LUKS1, &fopts,
++                      sizeof(fopts)));
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(0, size);
++}
++
++TEST_F(TestEncryption, EncryptionLoadBadSize)
++{
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
++
++  std::string name = get_temp_image_name();
++  uint64_t luks1_meta_size = 4 << 20;
++  std::string passphrase = "some passphrase";
++
++  ASSERT_EQ(0, create_image_pp(m_rbd, m_ioctx, name, luks1_meta_size, 22));
++  librbd::ImageCtx* ictx;
++  ASSERT_EQ(0, open_image(name, &ictx));
++  librbd::encryption_luks1_format_options_t fopts = {
++      RBD_ENCRYPTION_ALGORITHM_AES256, passphrase};
++  ASSERT_EQ(0, format(ictx, RBD_ENCRYPTION_FORMAT_LUKS1, &fopts,
++                      sizeof(fopts)));
++  close_image(ictx);
++
++  ASSERT_EQ(0, open_image(name, &ictx));
++  librbd::encryption_luks_format_options_t opts = {passphrase};
++  ASSERT_EQ(0, load(ictx, RBD_ENCRYPTION_FORMAT_LUKS, &opts, sizeof(opts)));
++  uint64_t size;
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(0, size);
++  close_image(ictx);
++
++  ASSERT_EQ(0, open_image(name, &ictx));
++  ASSERT_EQ(0, resize(ictx, luks1_meta_size - 1));
++  ASSERT_EQ(-EINVAL, load(ictx, RBD_ENCRYPTION_FORMAT_LUKS, &opts,
++                          sizeof(opts)));
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(luks1_meta_size - 1, size);
++}
++
++TEST_F(TestEncryption, EncryptionLoadBadStripePattern)
++{
++  REQUIRE_FEATURE(RBD_FEATURE_STRIPINGV2);
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
++
++  uint64_t features;
++  ASSERT_TRUE(get_features(&features));
++
++  std::string name1 = get_temp_image_name();
++  std::string name2 = get_temp_image_name();
++  std::string name3 = get_temp_image_name();
++  std::string passphrase = "some passphrase";
++
++  int order = 22;
++  ASSERT_EQ(0, m_rbd.create3(m_ioctx, name1.c_str(), 20 << 20, features,
++                             &order, 2 << 20, 2));
++  librbd::ImageCtx* ictx;
++  ASSERT_EQ(0, open_image(name1, &ictx));
++  librbd::encryption_luks1_format_options_t fopts = {
++      RBD_ENCRYPTION_ALGORITHM_AES256, passphrase};
++  ASSERT_EQ(0, format(ictx, RBD_ENCRYPTION_FORMAT_LUKS1, &fopts,
++                      sizeof(fopts)));
++  uint64_t size;
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(12 << 20, size);
++  close_image(ictx);
++
++  ASSERT_EQ(0, open_image(name1, &ictx));
++  // name2 - incompatible striping pattern
++  librbd::ImageOptions image_opts;
++  ASSERT_EQ(0, image_opts.set(RBD_IMAGE_OPTION_STRIPE_UNIT, 1 << 20));
++  ASSERT_EQ(0, image_opts.set(RBD_IMAGE_OPTION_STRIPE_COUNT, 3));
++  librbd::NoOpProgressContext prog_ctx;
++  ASSERT_EQ(0, librbd::api::Image<>::deep_copy(ictx, m_ioctx, name2.c_str(),
++                                               image_opts, prog_ctx));
++  // name3 - different but compatible striping pattern
++  ASSERT_EQ(0, image_opts.set(RBD_IMAGE_OPTION_STRIPE_COUNT, 2));
++  ASSERT_EQ(0, librbd::api::Image<>::deep_copy(ictx, m_ioctx, name3.c_str(),
++                                               image_opts, prog_ctx));
++  close_image(ictx);
++
++  ASSERT_EQ(0, open_image(name2, &ictx));
++  librbd::encryption_luks_format_options_t opts = {passphrase};
++  ASSERT_EQ(-EINVAL, load(ictx, RBD_ENCRYPTION_FORMAT_LUKS, &opts,
++                          sizeof(opts)));
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(20 << 20, size);
++  close_image(ictx);
++
++  ASSERT_EQ(0, open_image(name3, &ictx));
++  ASSERT_EQ(0, load(ictx, RBD_ENCRYPTION_FORMAT_LUKS, &opts, sizeof(opts)));
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(12 << 20, size);
++}
++
++TEST_F(TestEncryption, EncryptionLoadFormatMismatch)
++{
++  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
++
++  std::string name1 = get_temp_image_name();
++  std::string name2 = get_temp_image_name();
++  std::string name3 = get_temp_image_name();
++  std::string passphrase = "some passphrase";
++
++  librbd::encryption_luks1_format_options_t luks1_opts = {
++      RBD_ENCRYPTION_ALGORITHM_AES256, passphrase};
++  librbd::encryption_luks2_format_options_t luks2_opts = {
++      RBD_ENCRYPTION_ALGORITHM_AES256, passphrase};
++  librbd::encryption_luks_format_options_t luks_opts = {passphrase};
++
++#define LUKS_ONE {RBD_ENCRYPTION_FORMAT_LUKS1, &luks1_opts, sizeof(luks1_opts)}
++#define LUKS_TWO {RBD_ENCRYPTION_FORMAT_LUKS2, &luks2_opts, sizeof(luks2_opts)}
++#define LUKS_ANY {RBD_ENCRYPTION_FORMAT_LUKS, &luks_opts, sizeof(luks_opts)}
++
++  const std::vector<librbd::encryption_spec_t> bad_specs[] = {
++      {},
++      {LUKS_ONE},
++      {LUKS_TWO},
++      {LUKS_ONE, LUKS_ONE},
++      {LUKS_ONE, LUKS_TWO},
++      {LUKS_ONE, LUKS_ANY},
++      {LUKS_TWO, LUKS_TWO},
++      {LUKS_ANY, LUKS_TWO},
++      {LUKS_ONE, LUKS_ONE, LUKS_ONE},
++      {LUKS_ONE, LUKS_ONE, LUKS_TWO},
++      {LUKS_ONE, LUKS_ONE, LUKS_ANY},
++      {LUKS_ONE, LUKS_TWO, LUKS_ONE},
++      {LUKS_ONE, LUKS_TWO, LUKS_TWO},
++      {LUKS_ONE, LUKS_TWO, LUKS_ANY},
++      {LUKS_ONE, LUKS_ANY, LUKS_ONE},
++      {LUKS_ONE, LUKS_ANY, LUKS_TWO},
++      {LUKS_ONE, LUKS_ANY, LUKS_ANY},
++      {LUKS_TWO, LUKS_ONE, LUKS_TWO},
++      {LUKS_TWO, LUKS_TWO, LUKS_ONE},
++      {LUKS_TWO, LUKS_TWO, LUKS_TWO},
++      {LUKS_TWO, LUKS_TWO, LUKS_ANY},
++      {LUKS_TWO, LUKS_ANY, LUKS_TWO},
++      {LUKS_ANY, LUKS_ONE, LUKS_TWO},
++      {LUKS_ANY, LUKS_TWO, LUKS_ONE},
++      {LUKS_ANY, LUKS_TWO, LUKS_TWO},
++      {LUKS_ANY, LUKS_TWO, LUKS_ANY},
++      {LUKS_ANY, LUKS_ANY, LUKS_TWO},
++      {LUKS_ANY, LUKS_ANY, LUKS_ANY, LUKS_ANY}};
++
++  const std::vector<librbd::encryption_spec_t> good_specs[] = {
++      {LUKS_ANY},
++      {LUKS_TWO, LUKS_ONE},
++      {LUKS_TWO, LUKS_ANY},
++      {LUKS_ANY, LUKS_ONE},
++      {LUKS_ANY, LUKS_ANY},
++      {LUKS_TWO, LUKS_ONE, LUKS_ONE},
++      {LUKS_TWO, LUKS_ONE, LUKS_ANY},
++      {LUKS_TWO, LUKS_ANY, LUKS_ONE},
++      {LUKS_TWO, LUKS_ANY, LUKS_ANY},
++      {LUKS_ANY, LUKS_ONE, LUKS_ONE},
++      {LUKS_ANY, LUKS_ONE, LUKS_ANY},
++      {LUKS_ANY, LUKS_ANY, LUKS_ONE},
++      {LUKS_ANY, LUKS_ANY, LUKS_ANY}};
++
++  static_assert(std::size(bad_specs) + std::size(good_specs) == 1 + 3 + 9 + 27 + 1);
++
++#undef LUKS_ONE
++#undef LUKS_TWO
++#undef LUKS_ANY
++
++  ASSERT_EQ(0, create_image_pp(m_rbd, m_ioctx, name1, 40 << 20));
++  librbd::ImageCtx* ictx;
++  ASSERT_EQ(0, open_image(name1, &ictx));
++  ASSERT_EQ(0, format(ictx, RBD_ENCRYPTION_FORMAT_LUKS1, &luks1_opts,
++                      sizeof(luks1_opts)));
++  ASSERT_NO_FATAL_FAILURE(clone_image(ictx, "snap", name2));
++  close_image(ictx);
++
++  ASSERT_EQ(0, open_image(name2, &ictx));
++  ASSERT_NO_FATAL_FAILURE(clone_image(ictx, "snap", name3));
++  close_image(ictx);
++
++  ASSERT_EQ(0, open_image(name3, &ictx));
++  ASSERT_EQ(0, format(ictx, RBD_ENCRYPTION_FORMAT_LUKS2, &luks2_opts,
++                      sizeof(luks2_opts)));
++  close_image(ictx);
++
++  for (auto& specs : good_specs) {
++    ASSERT_EQ(0, open_image(name3, &ictx));
++    ASSERT_EQ(0, load(ictx, specs.data(), specs.size()));
++    close_image(ictx);
++  }
++
++  ASSERT_EQ(0, open_image(name3, &ictx));
++  for (auto& specs : bad_specs) {
++    ASSERT_EQ(-EINVAL, load(ictx, specs.data(), specs.size()));
++  }
++}
++
++TEST_F(TestEncryption, EncryptedResize)
++{
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
++
++  std::string name = get_temp_image_name();
++  uint64_t luks2_meta_size = 16 << 20;
++  uint64_t data_size = 10 << 20;
++  std::string passphrase = "some passphrase";
++
++  ASSERT_EQ(0, create_image_pp(m_rbd, m_ioctx, name,
++                               luks2_meta_size + data_size, 22));
++  librbd::ImageCtx* ictx;
++  ASSERT_EQ(0, open_image(name, &ictx));
++  uint64_t size;
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(luks2_meta_size + data_size, size);
++  librbd::encryption_luks2_format_options_t fopts = {
++      RBD_ENCRYPTION_ALGORITHM_AES256, passphrase};
++  ASSERT_EQ(0, format(ictx, RBD_ENCRYPTION_FORMAT_LUKS2, &fopts,
++                      sizeof(fopts)));
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(data_size, size);
++  ASSERT_EQ(0, resize(ictx, data_size * 3));
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(data_size * 3, size);
++  close_image(ictx);
++
++  ASSERT_EQ(0, open_image(name, &ictx));
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(luks2_meta_size + data_size * 3, size);
++  librbd::encryption_luks_format_options_t opts = {passphrase};
++  ASSERT_EQ(0, load(ictx, RBD_ENCRYPTION_FORMAT_LUKS, &opts, sizeof(opts)));
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(data_size * 3, size);
++  ASSERT_EQ(0, resize(ictx, data_size / 2));
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(data_size / 2, size);
++  close_image(ictx);
++
++  ASSERT_EQ(0, open_image(name, &ictx));
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(luks2_meta_size + data_size / 2, size);
++  ASSERT_EQ(0, load(ictx, RBD_ENCRYPTION_FORMAT_LUKS, &opts, sizeof(opts)));
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(data_size / 2, size);
++  ASSERT_EQ(0, resize(ictx, 0));
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(0, size);
++  close_image(ictx);
++
++  ASSERT_EQ(0, open_image(name, &ictx));
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(luks2_meta_size, size);
++  ASSERT_EQ(0, load(ictx, RBD_ENCRYPTION_FORMAT_LUKS, &opts, sizeof(opts)));
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(0, size);
++  ASSERT_EQ(0, resize(ictx, data_size));
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(data_size, size);
++  close_image(ictx);
++
++  ASSERT_EQ(0, open_image(name, &ictx));
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(luks2_meta_size + data_size, size);
++}
++
++TEST_F(TestEncryption, EncryptedFlattenSmallData)
++{
++  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
++
++  std::string parent_name = get_temp_image_name();
++  std::string clone_name = get_temp_image_name();
++  uint64_t data_size = 5000;
++  uint64_t luks2_meta_size = 16 << 20;
++  std::string passphrase = "some passphrase";
++
++  ASSERT_EQ(0, create_image_pp(m_rbd, m_ioctx, parent_name,
++                               luks2_meta_size + data_size, 22));
++  librbd::ImageCtx* ictx;
++  ASSERT_EQ(0, open_image(parent_name, &ictx));
++  librbd::encryption_luks2_format_options_t fopts = {
++      RBD_ENCRYPTION_ALGORITHM_AES256, passphrase};
++  ASSERT_EQ(0, format(ictx, RBD_ENCRYPTION_FORMAT_LUKS2, &fopts,
++                      sizeof(fopts)));
++  ceph::bufferlist bl;
++  bl.append(std::string(data_size, 'a'));
++  ASSERT_EQ(static_cast<ssize_t>(data_size),
++            librbd::api::Io<>::write(*ictx, 0, data_size, std::move(bl), 0));
++  ASSERT_NO_FATAL_FAILURE(clone_image(ictx, "snap", clone_name));
++  close_image(ictx);
++
++  ASSERT_EQ(0, open_image(clone_name, &ictx));
++  librbd::encryption_luks_format_options_t opts = {passphrase};
++  ASSERT_EQ(0, load(ictx, RBD_ENCRYPTION_FORMAT_LUKS, &opts, sizeof(opts)));
++  uint64_t size;
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(data_size, size);
++  uint64_t overlap;
++  ASSERT_EQ(0, librbd::get_overlap(ictx, &overlap));
++  ASSERT_EQ(data_size, overlap);
++  ceph::bufferlist expected_bl;
++  expected_bl.append(std::string(data_size, 'a'));
++  ceph::bufferlist read_bl1;
++  ASSERT_EQ(static_cast<ssize_t>(expected_bl.length()),
++            librbd::api::Io<>::read(*ictx, 0, expected_bl.length(),
++                                    librbd::io::ReadResult{&read_bl1}, 0));
++  ASSERT_TRUE(expected_bl.contents_equal(read_bl1));
++  ASSERT_EQ(0, flatten(ictx));
++  ceph::bufferlist read_bl2;
++  ASSERT_EQ(static_cast<ssize_t>(expected_bl.length()),
++            librbd::api::Io<>::read(*ictx, 0, expected_bl.length(),
++                                    librbd::io::ReadResult{&read_bl2}, 0));
++  ASSERT_TRUE(expected_bl.contents_equal(read_bl2));
++  close_image(ictx);
++
++  ASSERT_EQ(0, open_image(clone_name, &ictx));
++  ASSERT_EQ(0, load(ictx, RBD_ENCRYPTION_FORMAT_LUKS, &opts, sizeof(opts)));
++  ASSERT_EQ(0, librbd::get_size(ictx, &size));
++  ASSERT_EQ(data_size, size);
++  ASSERT_EQ(0, librbd::get_overlap(ictx, &overlap));
++  ASSERT_EQ(0, overlap);
++  ceph::bufferlist read_bl3;
++  ASSERT_EQ(static_cast<ssize_t>(expected_bl.length()),
++            librbd::api::Io<>::read(*ictx, 0, expected_bl.length(),
++                                    librbd::io::ReadResult{&read_bl3}, 0));
++  ASSERT_TRUE(expected_bl.contents_equal(read_bl3));
++}
++
++struct LUKSOnePassphrase {
++  int load(librbd::ImageCtx* ictx) {
++    librbd::encryption_luks_format_options_t opts = {m_passphrase};
++    return TestEncryption::load(ictx, RBD_ENCRYPTION_FORMAT_LUKS, &opts,
++                                sizeof(opts));
++  }
++
++  int load_flattened(librbd::ImageCtx* ictx) {
++    return load(ictx);
++  }
++
++  std::string m_passphrase = "some passphrase";
++};
++
++struct LUKSTwoPassphrases {
++  int load(librbd::ImageCtx* ictx) {
++    librbd::encryption_luks_format_options_t opts1 = {m_parent_passphrase};
++    librbd::encryption_luks_format_options_t opts2 = {m_clone_passphrase};
++    librbd::encryption_spec_t specs[] = {
++        {RBD_ENCRYPTION_FORMAT_LUKS, &opts2, sizeof(opts2)},
++        {RBD_ENCRYPTION_FORMAT_LUKS, &opts1, sizeof(opts1)}};
++    return TestEncryption::load(ictx, specs, std::size(specs));
++  }
++
++  int load_flattened(librbd::ImageCtx* ictx) {
++    librbd::encryption_luks_format_options_t opts = {m_clone_passphrase};
++    return TestEncryption::load(ictx, RBD_ENCRYPTION_FORMAT_LUKS, &opts,
++                                sizeof(opts));
++  }
++
++  std::string m_parent_passphrase = "parent passphrase";
++  std::string m_clone_passphrase = "clone passphrase";
++};
++
++struct PlaintextUnderLUKS1 : LUKSOnePassphrase {
++protected:
++  void setup_parent(librbd::ImageCtx* ictx, uint64_t data_size) {
++    ceph::bufferlist bl;
++    bl.append(std::string(data_size, 'a'));
++    ASSERT_EQ(static_cast<ssize_t>(data_size),
++              librbd::api::Io<>::write(*ictx, 0, data_size, std::move(bl), 0));
++
++    // before taking a parent snapshot, (temporarily) add extra space
++    // to the parent to account for upcoming LUKS1 header in the clone,
++    // making the clone able to reach all parent data
++    uint64_t luks1_meta_size = 4 << 20;
++    ASSERT_EQ(0, TestEncryption::resize(ictx, data_size + luks1_meta_size));
++  }
++
++  void setup_clone(librbd::ImageCtx* ictx, uint64_t data_size) {
++    librbd::encryption_luks1_format_options_t fopts =
++        {RBD_ENCRYPTION_ALGORITHM_AES256, m_passphrase};
++    ASSERT_EQ(0, TestEncryption::format(ictx, RBD_ENCRYPTION_FORMAT_LUKS1,
++                                        &fopts, sizeof(fopts)));
++  }
++};
++
++struct PlaintextUnderLUKS2 : LUKSOnePassphrase {
++  void setup_parent(librbd::ImageCtx* ictx, uint64_t data_size) {
++    ceph::bufferlist bl;
++    bl.append(std::string(data_size, 'a'));
++    ASSERT_EQ(static_cast<ssize_t>(data_size),
++              librbd::api::Io<>::write(*ictx, 0, data_size, std::move(bl), 0));
++
++    // before taking a parent snapshot, (temporarily) add extra space
++    // to the parent to account for upcoming LUKS2 header in the clone,
++    // making the clone able to reach all parent data
++    uint64_t luks2_meta_size = 16 << 20;
++    ASSERT_EQ(0, TestEncryption::resize(ictx, data_size + luks2_meta_size));
++  }
++
++  void setup_clone(librbd::ImageCtx* ictx, uint64_t data_size) {
++    librbd::encryption_luks2_format_options_t fopts =
++        {RBD_ENCRYPTION_ALGORITHM_AES256, m_passphrase};
++    ASSERT_EQ(0, TestEncryption::format(ictx, RBD_ENCRYPTION_FORMAT_LUKS2,
++                                        &fopts, sizeof(fopts)));
++  }
++};
++
++struct UnformattedLUKS1 : LUKSOnePassphrase {
++  void setup_parent(librbd::ImageCtx* ictx, uint64_t data_size) {
++    uint64_t luks1_meta_size = 4 << 20;
++    ASSERT_EQ(0, TestEncryption::resize(ictx, data_size + luks1_meta_size));
++    librbd::encryption_luks1_format_options_t fopts = {
++        RBD_ENCRYPTION_ALGORITHM_AES256, m_passphrase};
++    ASSERT_EQ(0, TestEncryption::format(ictx, RBD_ENCRYPTION_FORMAT_LUKS1,
++                                        &fopts, sizeof(fopts)));
++    ceph::bufferlist bl;
++    bl.append(std::string(data_size, 'a'));
++    ASSERT_EQ(static_cast<ssize_t>(data_size),
++              librbd::api::Io<>::write(*ictx, 0, data_size, std::move(bl), 0));
++  }
++
++  void setup_clone(librbd::ImageCtx* ictx, uint64_t data_size) {}
++};
++
++struct LUKS1UnderLUKS1 : LUKSTwoPassphrases {
++  void setup_parent(librbd::ImageCtx* ictx, uint64_t data_size) {
++    uint64_t luks1_meta_size = 4 << 20;
++    ASSERT_EQ(0, TestEncryption::resize(ictx, data_size + luks1_meta_size));
++    librbd::encryption_luks1_format_options_t fopts = {
++        RBD_ENCRYPTION_ALGORITHM_AES256, m_parent_passphrase};
++    ASSERT_EQ(0, TestEncryption::format(ictx, RBD_ENCRYPTION_FORMAT_LUKS1,
++                                        &fopts, sizeof(fopts)));
++    ceph::bufferlist bl;
++    bl.append(std::string(data_size, 'a'));
++    ASSERT_EQ(static_cast<ssize_t>(data_size),
++              librbd::api::Io<>::write(*ictx, 0, data_size, std::move(bl), 0));
++  }
++
++  void setup_clone(librbd::ImageCtx* ictx, uint64_t data_size) {
++    librbd::encryption_luks1_format_options_t fopts =
++        {RBD_ENCRYPTION_ALGORITHM_AES256, m_clone_passphrase};
++    ASSERT_EQ(0, TestEncryption::format(ictx, RBD_ENCRYPTION_FORMAT_LUKS1,
++                                        &fopts, sizeof(fopts)));
++  }
++};
++
++struct LUKS1UnderLUKS2 : LUKSTwoPassphrases {
++  void setup_parent(librbd::ImageCtx* ictx, uint64_t data_size) {
++    uint64_t luks1_meta_size = 4 << 20;
++    ASSERT_EQ(0, TestEncryption::resize(ictx, data_size + luks1_meta_size));
++    librbd::encryption_luks1_format_options_t fopts = {
++        RBD_ENCRYPTION_ALGORITHM_AES256, m_parent_passphrase};
++    ASSERT_EQ(0, TestEncryption::format(ictx, RBD_ENCRYPTION_FORMAT_LUKS1,
++                                        &fopts, sizeof(fopts)));
++    ceph::bufferlist bl;
++    bl.append(std::string(data_size, 'a'));
++    ASSERT_EQ(static_cast<ssize_t>(data_size),
++              librbd::api::Io<>::write(*ictx, 0, data_size, std::move(bl), 0));
++
++    // before taking a parent snapshot, (temporarily) add extra space
++    // to the parent to account for upcoming LUKS2 header in the clone,
++    // making the clone able to reach all parent data
++    // space taken by LUKS1 header in the parent would be reused
++    uint64_t luks2_meta_size = 16 << 20;
++    ASSERT_EQ(0, TestEncryption::resize(
++        ictx, data_size + luks2_meta_size - luks1_meta_size));
++  }
++
++  void setup_clone(librbd::ImageCtx* ictx, uint64_t data_size) {
++    librbd::encryption_luks2_format_options_t fopts =
++        {RBD_ENCRYPTION_ALGORITHM_AES256, m_clone_passphrase};
++    ASSERT_EQ(0, TestEncryption::format(ictx, RBD_ENCRYPTION_FORMAT_LUKS2,
++                                        &fopts, sizeof(fopts)));
++  }
++};
++
++struct UnformattedLUKS2 : LUKSOnePassphrase {
++  void setup_parent(librbd::ImageCtx* ictx, uint64_t data_size) {
++    uint64_t luks2_meta_size = 16 << 20;
++    ASSERT_EQ(0, TestEncryption::resize(ictx, data_size + luks2_meta_size));
++    librbd::encryption_luks2_format_options_t fopts = {
++        RBD_ENCRYPTION_ALGORITHM_AES256, m_passphrase};
++    ASSERT_EQ(0, TestEncryption::format(ictx, RBD_ENCRYPTION_FORMAT_LUKS2,
++                                        &fopts, sizeof(fopts)));
++    ceph::bufferlist bl;
++    bl.append(std::string(data_size, 'a'));
++    ASSERT_EQ(static_cast<ssize_t>(data_size),
++              librbd::api::Io<>::write(*ictx, 0, data_size, std::move(bl), 0));
++  }
++
++  void setup_clone(librbd::ImageCtx* ictx, uint64_t data_size) {}
++};
++
++struct LUKS2UnderLUKS2 : LUKSTwoPassphrases {
++  void setup_parent(librbd::ImageCtx* ictx, uint64_t data_size) {
++    uint64_t luks2_meta_size = 16 << 20;
++    ASSERT_EQ(0, TestEncryption::resize(ictx, data_size + luks2_meta_size));
++    librbd::encryption_luks2_format_options_t fopts = {
++        RBD_ENCRYPTION_ALGORITHM_AES256, m_parent_passphrase};
++    ASSERT_EQ(0, TestEncryption::format(ictx, RBD_ENCRYPTION_FORMAT_LUKS2,
++                                        &fopts, sizeof(fopts)));
++    ceph::bufferlist bl;
++    bl.append(std::string(data_size, 'a'));
++    ASSERT_EQ(static_cast<ssize_t>(data_size),
++              librbd::api::Io<>::write(*ictx, 0, data_size, std::move(bl), 0));
++  }
++
++  void setup_clone(librbd::ImageCtx* ictx, uint64_t data_size) {
++    librbd::encryption_luks2_format_options_t fopts =
++        {RBD_ENCRYPTION_ALGORITHM_AES256, m_clone_passphrase};
++    ASSERT_EQ(0, TestEncryption::format(ictx, RBD_ENCRYPTION_FORMAT_LUKS2,
++                                        &fopts, sizeof(fopts)));
++  }
++};
++
++struct LUKS2UnderLUKS1 : LUKSTwoPassphrases {
++  void setup_parent(librbd::ImageCtx* ictx, uint64_t data_size) {
++    uint64_t luks2_meta_size = 16 << 20;
++    ASSERT_EQ(0, TestEncryption::resize(ictx, data_size + luks2_meta_size));
++    librbd::encryption_luks2_format_options_t fopts = {
++        RBD_ENCRYPTION_ALGORITHM_AES256, m_parent_passphrase};
++    ASSERT_EQ(0, TestEncryption::format(ictx, RBD_ENCRYPTION_FORMAT_LUKS2,
++                                        &fopts, sizeof(fopts)));
++    ceph::bufferlist bl;
++    bl.append(std::string(data_size, 'a'));
++    ASSERT_EQ(static_cast<ssize_t>(data_size),
++              librbd::api::Io<>::write(*ictx, 0, data_size, std::move(bl), 0));
++  }
++
++  void setup_clone(librbd::ImageCtx* ictx, uint64_t data_size) {
++    librbd::encryption_luks1_format_options_t fopts =
++        {RBD_ENCRYPTION_ALGORITHM_AES256, m_clone_passphrase};
++    ASSERT_EQ(0, TestEncryption::format(ictx, RBD_ENCRYPTION_FORMAT_LUKS1,
++                                        &fopts, sizeof(fopts)));
++
++    // after loading encryption on the clone, one can get rid of
++    // unneeded space allowance in the clone arising from LUKS2 header
++    // in the parent being bigger than LUKS1 header in the clone
++    ASSERT_EQ(0, load(ictx));
++    ASSERT_EQ(0, TestEncryption::resize(ictx, data_size));
++  }
++};
++
++template <typename FormatPolicy>
++class EncryptedFlattenTest : public TestEncryption, FormatPolicy {
++protected:
++  void create_and_setup() {
++    ASSERT_EQ(0, create_image_pp(m_rbd, m_ioctx, m_parent_name, m_data_size,
++                                 22));
++    librbd::ImageCtx* ictx;
++    ASSERT_EQ(0, open_image(m_parent_name, &ictx));
++    ASSERT_NO_FATAL_FAILURE(FormatPolicy::setup_parent(ictx, m_data_size));
++    ASSERT_NO_FATAL_FAILURE(clone_image(ictx, "snap", m_clone_name));
++    close_image(ictx);
++
++    ASSERT_EQ(0, open_image(m_clone_name, &ictx));
++    ASSERT_NO_FATAL_FAILURE(FormatPolicy::setup_clone(ictx, m_data_size));
++    close_image(ictx);
++  }
++
++  void open_and_load(librbd::ImageCtx** ictx) {
++    ASSERT_EQ(0, open_image(m_clone_name, ictx));
++    ASSERT_EQ(0, FormatPolicy::load(*ictx));
++  }
++
++  void open_and_load_flattened(librbd::ImageCtx** ictx) {
++    ASSERT_EQ(0, open_image(m_clone_name, ictx));
++    ASSERT_EQ(0, FormatPolicy::load_flattened(*ictx));
++  }
++
++  void verify_size_and_overlap(librbd::ImageCtx* ictx, uint64_t expected_size,
++                               uint64_t expected_overlap) {
++    uint64_t size;
++    ASSERT_EQ(0, librbd::get_size(ictx, &size));
++    EXPECT_EQ(expected_size, size);
++    uint64_t overlap;
++    ASSERT_EQ(0, librbd::get_overlap(ictx, &overlap));
++    EXPECT_EQ(expected_overlap, overlap);
++  }
++
++  void verify_data(librbd::ImageCtx* ictx,
++                   const ceph::bufferlist& expected_bl) {
++    ceph::bufferlist read_bl;
++    ASSERT_EQ(static_cast<ssize_t>(expected_bl.length()),
++              librbd::api::Io<>::read(*ictx, 0, expected_bl.length(),
++                                      librbd::io::ReadResult{&read_bl}, 0));
++    EXPECT_TRUE(expected_bl.contents_equal(read_bl));
++  }
++
++  std::string m_parent_name = get_temp_image_name();
++  std::string m_clone_name = get_temp_image_name();
++  uint64_t m_data_size = 25 << 20;
++};
++
++using EncryptedFlattenTestTypes =
++    ::testing::Types<PlaintextUnderLUKS1, PlaintextUnderLUKS2,
++                     UnformattedLUKS1, LUKS1UnderLUKS1, LUKS1UnderLUKS2,
++                     UnformattedLUKS2, LUKS2UnderLUKS2, LUKS2UnderLUKS1>;
++TYPED_TEST_SUITE(EncryptedFlattenTest, EncryptedFlattenTestTypes);
++
++TYPED_TEST(EncryptedFlattenTest, Simple)
++{
++  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
++
++  ASSERT_NO_FATAL_FAILURE(this->create_and_setup());
++
++  ceph::bufferlist expected_bl;
++  expected_bl.append(std::string(this->m_data_size, 'a'));
++
++  librbd::ImageCtx* ictx;
++  ASSERT_NO_FATAL_FAILURE(this->open_and_load(&ictx));
++  this->verify_size_and_overlap(ictx, this->m_data_size, this->m_data_size);
++  this->verify_data(ictx, expected_bl);
++  ASSERT_EQ(0, this->flatten(ictx));
++  this->verify_data(ictx, expected_bl);
++  this->close_image(ictx);
++
++  ASSERT_NO_FATAL_FAILURE(this->open_and_load_flattened(&ictx));
++  this->verify_size_and_overlap(ictx, this->m_data_size, 0);
++  this->verify_data(ictx, expected_bl);
++}
++
++TYPED_TEST(EncryptedFlattenTest, Grow)
++{
++  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
++
++  ASSERT_NO_FATAL_FAILURE(this->create_and_setup());
++
++  ceph::bufferlist expected_bl;
++  expected_bl.append(std::string(this->m_data_size, 'a'));
++  expected_bl.append_zero(1);
++
++  librbd::ImageCtx* ictx;
++  ASSERT_NO_FATAL_FAILURE(this->open_and_load(&ictx));
++  ASSERT_EQ(0, this->resize(ictx, this->m_data_size + 1));
++  this->verify_size_and_overlap(ictx, this->m_data_size + 1,
++                                this->m_data_size);
++  this->verify_data(ictx, expected_bl);
++  ASSERT_EQ(0, this->flatten(ictx));
++  this->verify_data(ictx, expected_bl);
++  this->close_image(ictx);
++
++  ASSERT_NO_FATAL_FAILURE(this->open_and_load_flattened(&ictx));
++  this->verify_size_and_overlap(ictx, this->m_data_size + 1, 0);
++  this->verify_data(ictx, expected_bl);
++}
++
++TYPED_TEST(EncryptedFlattenTest, Shrink)
++{
++  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
++
++  ASSERT_NO_FATAL_FAILURE(this->create_and_setup());
++
++  ceph::bufferlist expected_bl;
++  expected_bl.append(std::string(this->m_data_size - 1, 'a'));
++
++  librbd::ImageCtx* ictx;
++  ASSERT_NO_FATAL_FAILURE(this->open_and_load(&ictx));
++  ASSERT_EQ(0, this->resize(ictx, this->m_data_size - 1));
++  this->verify_size_and_overlap(ictx, this->m_data_size - 1,
++                                this->m_data_size - 1);
++  this->verify_data(ictx, expected_bl);
++  ASSERT_EQ(0, this->flatten(ictx));
++  this->verify_data(ictx, expected_bl);
++  this->close_image(ictx);
++
++  ASSERT_NO_FATAL_FAILURE(this->open_and_load_flattened(&ictx));
++  this->verify_size_and_overlap(ictx, this->m_data_size - 1, 0);
++  this->verify_data(ictx, expected_bl);
++}
++
++TYPED_TEST(EncryptedFlattenTest, ShrinkToOne)
++{
++  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
++
++  ASSERT_NO_FATAL_FAILURE(this->create_and_setup());
++
++  ceph::bufferlist expected_bl;
++  expected_bl.append(std::string(1, 'a'));
++
++  librbd::ImageCtx* ictx;
++  ASSERT_NO_FATAL_FAILURE(this->open_and_load(&ictx));
++  ASSERT_EQ(0, this->resize(ictx, 1));
++  this->verify_size_and_overlap(ictx, 1, 1);
++  this->verify_data(ictx, expected_bl);
++  ASSERT_EQ(0, this->flatten(ictx));
++  this->verify_data(ictx, expected_bl);
++  this->close_image(ictx);
++
++  ASSERT_NO_FATAL_FAILURE(this->open_and_load_flattened(&ictx));
++  this->verify_size_and_overlap(ictx, 1, 0);
++  this->verify_data(ictx, expected_bl);
++}
++
++TYPED_TEST(EncryptedFlattenTest, ShrinkToOneAfterSnapshot)
++{
++  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
++
++  ASSERT_NO_FATAL_FAILURE(this->create_and_setup());
++
++  ceph::bufferlist expected_bl;
++  expected_bl.append(std::string(1, 'a'));
++
++  librbd::ImageCtx* ictx;
++  ASSERT_NO_FATAL_FAILURE(this->open_and_load(&ictx));
++  ASSERT_EQ(0, this->snap_create(*ictx, "snap"));
++  ASSERT_EQ(0, this->resize(ictx, 1));
++  this->verify_size_and_overlap(ictx, 1, 1);
++  this->verify_data(ictx, expected_bl);
++  ASSERT_EQ(0, this->flatten(ictx));
++  this->verify_data(ictx, expected_bl);
++  this->close_image(ictx);
++
++  ASSERT_NO_FATAL_FAILURE(this->open_and_load_flattened(&ictx));
++  this->verify_size_and_overlap(ictx, 1, 0);
++  this->verify_data(ictx, expected_bl);
++}
++
++TYPED_TEST(EncryptedFlattenTest, MinOverlap)
++{
++  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
++
++  ASSERT_NO_FATAL_FAILURE(this->create_and_setup());
++
++  ceph::bufferlist expected_bl;
++  expected_bl.append(std::string(1, 'a'));
++  expected_bl.append_zero(this->m_data_size - 1);
++
++  librbd::ImageCtx* ictx;
++  ASSERT_NO_FATAL_FAILURE(this->open_and_load(&ictx));
++  ASSERT_EQ(0, this->resize(ictx, 1));
++  ASSERT_EQ(0, this->resize(ictx, this->m_data_size));
++  this->verify_size_and_overlap(ictx, this->m_data_size, 1);
++  this->verify_data(ictx, expected_bl);
++  ASSERT_EQ(0, this->flatten(ictx));
++  this->verify_data(ictx, expected_bl);
++  this->close_image(ictx);
++
++  ASSERT_NO_FATAL_FAILURE(this->open_and_load_flattened(&ictx));
++  this->verify_size_and_overlap(ictx, this->m_data_size, 0);
++  this->verify_data(ictx, expected_bl);
++}
++
++TYPED_TEST(EncryptedFlattenTest, ZeroOverlap)
++{
++  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
++
++  ASSERT_NO_FATAL_FAILURE(this->create_and_setup());
++
++  ceph::bufferlist expected_bl;
++  expected_bl.append_zero(this->m_data_size);
++
++  librbd::ImageCtx* ictx;
++  ASSERT_NO_FATAL_FAILURE(this->open_and_load(&ictx));
++  ASSERT_EQ(0, this->resize(ictx, 0));
++  ASSERT_EQ(0, this->resize(ictx, this->m_data_size));
++  this->verify_size_and_overlap(ictx, this->m_data_size, 0);
++  this->verify_data(ictx, expected_bl);
++  ASSERT_EQ(0, this->flatten(ictx));
++  this->verify_data(ictx, expected_bl);
++  this->close_image(ictx);
++
++  ASSERT_NO_FATAL_FAILURE(this->open_and_load_flattened(&ictx));
++  this->verify_size_and_overlap(ictx, this->m_data_size, 0);
++  this->verify_data(ictx, expected_bl);
++}
++
++#endif // HAVE_LIBCRYPTSETUP
+diff --git a/src/test/librbd/test_fixture.cc b/src/test/librbd/test_fixture.cc
+index 5aa85715e42a..c968be28d39c 100644
+--- a/src/test/librbd/test_fixture.cc
++++ b/src/test/librbd/test_fixture.cc
+@@ -107,12 +107,12 @@ int TestFixture::snap_protect(librbd::ImageCtx &ictx,
+                                        snap_name.c_str());
+ }
+ 
+-int TestFixture::flatten(librbd::ImageCtx &ictx,
+-                         librbd::ProgressContext &prog_ctx) {
+-  return ictx.operations->flatten(prog_ctx);
++int TestFixture::flatten(librbd::ImageCtx *ictx) {
++  librbd::NoOpProgressContext prog_ctx;
++  return ictx->operations->flatten(prog_ctx);
+ }
+ 
+-int TestFixture::resize(librbd::ImageCtx *ictx, uint64_t size){
++int TestFixture::resize(librbd::ImageCtx *ictx, uint64_t size) {
+   librbd::NoOpProgressContext prog_ctx;
+   return ictx->operations->resize(size, true, prog_ctx);
+ }
+diff --git a/src/test/librbd/test_fixture.h b/src/test/librbd/test_fixture.h
+index 0369fc7c8d61..3ae07cce83b2 100644
+--- a/src/test/librbd/test_fixture.h
++++ b/src/test/librbd/test_fixture.h
+@@ -30,8 +30,8 @@ class TestFixture : public ::testing::Test {
+   int snap_create(librbd::ImageCtx &ictx, const std::string &snap_name);
+   int snap_protect(librbd::ImageCtx &ictx, const std::string &snap_name);
+ 
+-  int flatten(librbd::ImageCtx &ictx, librbd::ProgressContext &prog_ctx);
+-  int resize(librbd::ImageCtx *ictx, uint64_t size);
++  static int flatten(librbd::ImageCtx *ictx);
++  static int resize(librbd::ImageCtx *ictx, uint64_t size);
+ 
+   int lock_image(librbd::ImageCtx &ictx, ClsLockType lock_type,
+                  const std::string &cookie);
+diff --git a/src/test/librbd/test_librbd.cc b/src/test/librbd/test_librbd.cc
+index 6f142b911576..95d0373ee56f 100644
+--- a/src/test/librbd/test_librbd.cc
++++ b/src/test/librbd/test_librbd.cc
+@@ -2465,1341 +2465,6 @@ TEST_F(TestLibRBD, TestEncryptionLUKS2)
+   rados_ioctx_destroy(ioctx);
+ }
+ 
+-#ifdef HAVE_LIBCRYPTSETUP
+-
+-TEST_F(TestLibRBD, TestCloneEncryption)
+-{
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
+-  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
+-
+-  rados_ioctx_t ioctx;
+-  rados_ioctx_create(_cluster, m_pool_name.c_str(), &ioctx);
+-  ASSERT_EQ(0, rados_conf_set(
+-          _cluster, "rbd_read_from_replica_policy", "balance"));
+-
+-  // create base image, write 'a's
+-  int order = 0;
+-  std::string name = get_temp_image_name();
+-  uint64_t size = 256 << 20;
+-  ASSERT_EQ(0, create_image(ioctx, name.c_str(), size, &order));
+-
+-  rbd_image_t image;
+-  ASSERT_EQ(0, rbd_open(ioctx, name.c_str(), &image, NULL));
+-  ASSERT_PASSED(write_test_data, image, "aaaa", 0, 4, 0);
+-  ASSERT_EQ(0, rbd_flush(image));
+-
+-  // clone, encrypt with LUKS1, write 'b's
+-  ASSERT_EQ(0, rbd_snap_create(image, "snap"));
+-  ASSERT_EQ(0, rbd_snap_protect(image, "snap"));
+-
+-  rbd_image_options_t image_opts;
+-  rbd_image_options_create(&image_opts);
+-  BOOST_SCOPE_EXIT_ALL( (&image_opts) ) {
+-    rbd_image_options_destroy(image_opts);
+-  };
+-  std::string child1_name = get_temp_image_name();
+-  ASSERT_EQ(0, rbd_clone3(ioctx, name.c_str(), "snap", ioctx,
+-                          child1_name.c_str(), image_opts));
+-
+-  rbd_image_t child1;
+-  ASSERT_EQ(0, rbd_open(ioctx, child1_name.c_str(), &child1, NULL));
+-
+-  rbd_encryption_luks1_format_options_t child1_opts = {
+-          .alg = RBD_ENCRYPTION_ALGORITHM_AES256,
+-          .passphrase = "password",
+-          .passphrase_size = 8,
+-  };
+-  ASSERT_EQ(-EINVAL, rbd_encryption_load(
+-          child1, RBD_ENCRYPTION_FORMAT_LUKS1, &child1_opts,
+-          sizeof(child1_opts)));
+-  ASSERT_EQ(0, rbd_encryption_format(
+-          child1, RBD_ENCRYPTION_FORMAT_LUKS1, &child1_opts,
+-          sizeof(child1_opts)));
+-  ASSERT_EQ(0, rbd_encryption_load(
+-          child1, RBD_ENCRYPTION_FORMAT_LUKS1, &child1_opts,
+-          sizeof(child1_opts)));
+-  ASSERT_PASSED(write_test_data, child1, "bbbb", 64 << 20, 4, 0);
+-  ASSERT_EQ(0, rbd_flush(child1));
+-
+-  // clone, encrypt with LUKS2 (same passphrase), write 'c's
+-  ASSERT_EQ(0, rbd_snap_create(child1, "snap"));
+-  ASSERT_EQ(0, rbd_snap_protect(child1, "snap"));
+-
+-  std::string child2_name = get_temp_image_name();
+-  ASSERT_EQ(0, rbd_clone3(ioctx, child1_name.c_str(), "snap", ioctx,
+-                          child2_name.c_str(), image_opts));
+-
+-  rbd_image_t child2;
+-  ASSERT_EQ(0, rbd_open(ioctx, child2_name.c_str(), &child2, NULL));
+-
+-  rbd_encryption_luks2_format_options_t child2_opts = {
+-          .alg = RBD_ENCRYPTION_ALGORITHM_AES256,
+-          .passphrase = "password",
+-          .passphrase_size = 8,
+-  };
+-  ASSERT_EQ(0, rbd_encryption_format(
+-          child2, RBD_ENCRYPTION_FORMAT_LUKS2, &child2_opts,
+-          sizeof(child2_opts)));
+-  rbd_encryption_luks_format_options_t child2_lopts = {
+-          .passphrase = "password",
+-          .passphrase_size = 8,
+-  };
+-  ASSERT_EQ(0, rbd_encryption_load(
+-          child2, RBD_ENCRYPTION_FORMAT_LUKS, &child2_lopts,
+-          sizeof(child2_lopts)));
+-  ASSERT_PASSED(write_test_data, child2, "cccc", 128 << 20, 4, 0);
+-  ASSERT_EQ(0, rbd_flush(child2));
+-
+-  // clone, encrypt with LUKS2 (different passphrase)
+-  ASSERT_EQ(0, rbd_snap_create(child2, "snap"));
+-  ASSERT_EQ(0, rbd_snap_protect(child2, "snap"));
+-
+-  std::string child3_name = get_temp_image_name();
+-  ASSERT_EQ(0, rbd_clone3(ioctx, child2_name.c_str(), "snap", ioctx,
+-                          child3_name.c_str(), image_opts));
+-
+-  rbd_image_t child3;
+-  ASSERT_EQ(0, rbd_open(ioctx, child3_name.c_str(), &child3, NULL));
+-
+-  rbd_encryption_luks2_format_options_t child3_opts = {
+-          .alg = RBD_ENCRYPTION_ALGORITHM_AES256,
+-          .passphrase = "12345678",
+-          .passphrase_size = 8,
+-  };
+-  ASSERT_EQ(0, rbd_encryption_format(
+-          child3, RBD_ENCRYPTION_FORMAT_LUKS2, &child3_opts,
+-          sizeof(child3_opts)));
+-  ASSERT_EQ(-EPERM, rbd_encryption_load(
+-        child3, RBD_ENCRYPTION_FORMAT_LUKS2, &child3_opts,
+-        sizeof(child3_opts)));
+-
+-  // verify child3 data
+-  rbd_encryption_spec_t specs[] = {
+-          { .format = RBD_ENCRYPTION_FORMAT_LUKS2,
+-            .opts = &child3_opts,
+-            .opts_size = sizeof(child3_opts)},
+-          { .format = RBD_ENCRYPTION_FORMAT_LUKS2,
+-            .opts = &child2_opts,
+-            .opts_size = sizeof(child2_opts)},
+-          { .format = RBD_ENCRYPTION_FORMAT_LUKS1,
+-            .opts = &child1_opts,
+-            .opts_size = sizeof(child1_opts)}
+-  };
+-
+-  ASSERT_EQ(0, rbd_encryption_load2(child3, specs, 3));
+-
+-  ASSERT_PASSED(read_test_data, child3, "aaaa", 0, 4, 0);
+-  ASSERT_PASSED(read_test_data, child3, "bbbb", 64 << 20, 4, 0);
+-  ASSERT_PASSED(read_test_data, child3, "cccc", 128 << 20, 4, 0);
+-
+-  // clone without formatting
+-  ASSERT_EQ(0, rbd_snap_create(child3, "snap"));
+-  ASSERT_EQ(0, rbd_snap_protect(child3, "snap"));
+-
+-  std::string child4_name = get_temp_image_name();
+-  ASSERT_EQ(0, rbd_clone3(ioctx, child3_name.c_str(), "snap", ioctx,
+-                          child4_name.c_str(), image_opts));
+-
+-  rbd_image_t child4;
+-  ASSERT_EQ(0, rbd_open(ioctx, child4_name.c_str(), &child4, NULL));
+-
+-  rbd_encryption_spec_t child4_specs[] = {
+-          { .format = RBD_ENCRYPTION_FORMAT_LUKS2,
+-            .opts = &child3_opts,
+-            .opts_size = sizeof(child3_opts)},
+-          { .format = RBD_ENCRYPTION_FORMAT_LUKS2,
+-            .opts = &child3_opts,
+-            .opts_size = sizeof(child3_opts)},
+-          { .format = RBD_ENCRYPTION_FORMAT_LUKS2,
+-            .opts = &child2_opts,
+-            .opts_size = sizeof(child2_opts)},
+-          { .format = RBD_ENCRYPTION_FORMAT_LUKS1,
+-            .opts = &child1_opts,
+-            .opts_size = sizeof(child1_opts)}
+-  };
+-
+-  ASSERT_EQ(0, rbd_encryption_load2(child4, child4_specs, 4));
+-
+-  // flatten child4
+-  ASSERT_EQ(0, rbd_flatten(child4));
+-
+-  // reopen child4 and load encryption
+-  ASSERT_EQ(0, rbd_close(child4));
+-  ASSERT_EQ(0, rbd_open(ioctx, child4_name.c_str(), &child4, NULL));
+-  ASSERT_EQ(0, rbd_encryption_load(
+-          child4, RBD_ENCRYPTION_FORMAT_LUKS2, &child3_opts,
+-          sizeof(child3_opts)));
+-
+-  // verify flattend image
+-  ASSERT_PASSED(read_test_data, child4, "aaaa", 0, 4, 0);
+-  ASSERT_PASSED(read_test_data, child4, "bbbb", 64 << 20, 4, 0);
+-  ASSERT_PASSED(read_test_data, child4, "cccc", 128 << 20, 4, 0);
+-
+-  ASSERT_EQ(0, rbd_close(child4));
+-  ASSERT_EQ(0, rbd_remove(ioctx, child4_name.c_str()));
+-  ASSERT_EQ(0, rbd_snap_unprotect(child3, "snap"));
+-  ASSERT_EQ(0, rbd_snap_remove(child3, "snap"));
+-  ASSERT_EQ(0, rbd_close(child3));
+-  ASSERT_EQ(0, rbd_remove(ioctx, child3_name.c_str()));
+-  ASSERT_EQ(0, rbd_snap_unprotect(child2, "snap"));
+-  ASSERT_EQ(0, rbd_snap_remove(child2, "snap"));
+-  ASSERT_EQ(0, rbd_close(child2));
+-  ASSERT_EQ(0, rbd_remove(ioctx, child2_name.c_str()));
+-  ASSERT_EQ(0, rbd_snap_unprotect(child1, "snap"));
+-  ASSERT_EQ(0, rbd_snap_remove(child1, "snap"));
+-  ASSERT_EQ(0, rbd_close(child1));
+-  ASSERT_EQ(0, rbd_remove(ioctx, child1_name.c_str()));
+-  ASSERT_EQ(0, rbd_snap_unprotect(image, "snap"));
+-  ASSERT_EQ(0, rbd_snap_remove(image, "snap"));
+-  ASSERT_EQ(0, rbd_close(image));
+-  ASSERT_EQ(0, rbd_remove(ioctx, name.c_str()));
+-  rados_ioctx_destroy(ioctx);
+-}
+-
+-TEST_F(TestLibRBD, LUKS1UnderLUKS2WithoutResize)
+-{
+-  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
+-
+-  librados::IoCtx ioctx;
+-  ASSERT_EQ(0, _rados.ioctx_create(m_pool_name.c_str(), ioctx));
+-
+-  librbd::RBD rbd;
+-  std::string parent_name = get_temp_image_name();
+-  std::string clone_name = get_temp_image_name();
+-  uint64_t data_size = 25 << 20;
+-  uint64_t luks1_meta_size = 4 << 20;
+-  uint64_t luks2_meta_size = 16 << 20;
+-  std::string parent_passphrase = "parent passphrase";
+-  std::string clone_passphrase = "clone passphrase";
+-
+-  {
+-    int order = 22;
+-    ASSERT_EQ(0, create_image_pp(rbd, ioctx, parent_name.c_str(),
+-                                 luks1_meta_size + data_size, &order));
+-    librbd::Image parent;
+-    ASSERT_EQ(0, rbd.open(ioctx, parent, parent_name.c_str(), nullptr));
+-
+-    librbd::encryption_luks1_format_options_t fopts = {
+-        RBD_ENCRYPTION_ALGORITHM_AES256, parent_passphrase};
+-    ASSERT_EQ(0, parent.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS1, &fopts,
+-                                          sizeof(fopts)));
+-
+-    ceph::bufferlist bl;
+-    bl.append(std::string(data_size, 'a'));
+-    ASSERT_EQ(data_size, parent.write(0, data_size, bl));
+-
+-    ASSERT_EQ(0, parent.snap_create("snap"));
+-    ASSERT_EQ(0, parent.snap_protect("snap"));
+-    uint64_t features;
+-    ASSERT_EQ(0, parent.features(&features));
+-    ASSERT_EQ(0, rbd.clone(ioctx, parent_name.c_str(), "snap", ioctx,
+-                           clone_name.c_str(), features, &order));
+-  }
+-
+-  {
+-    librbd::Image clone;
+-    ASSERT_EQ(0, rbd.open(ioctx, clone, clone_name.c_str(), nullptr));
+-
+-    librbd::encryption_luks2_format_options_t fopts =
+-        {RBD_ENCRYPTION_ALGORITHM_AES256, clone_passphrase};
+-    ASSERT_EQ(0, clone.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS2, &fopts,
+-                                         sizeof(fopts)));
+-
+-    librbd::encryption_luks_format_options_t opts1 = {parent_passphrase};
+-    librbd::encryption_luks_format_options_t opts2 = {clone_passphrase};
+-    librbd::encryption_spec_t specs[] = {
+-        {RBD_ENCRYPTION_FORMAT_LUKS, &opts2, sizeof(opts2)},
+-        {RBD_ENCRYPTION_FORMAT_LUKS, &opts1, sizeof(opts1)}};
+-    ASSERT_EQ(0, clone.encryption_load2(specs, std::size(specs)));
+-
+-    uint64_t size;
+-    ASSERT_EQ(0, clone.size(&size));
+-    EXPECT_EQ(data_size + luks1_meta_size - luks2_meta_size, size);
+-    uint64_t overlap;
+-    ASSERT_EQ(0, clone.overlap(&overlap));
+-    EXPECT_EQ(data_size + luks1_meta_size - luks2_meta_size, overlap);
+-
+-    ceph::bufferlist expected_bl;
+-    expected_bl.append(std::string(
+-        data_size + luks1_meta_size - luks2_meta_size, 'a'));
+-
+-    ceph::bufferlist read_bl;
+-    ASSERT_EQ(expected_bl.length(),
+-              clone.read(0, expected_bl.length(), read_bl));
+-    EXPECT_TRUE(expected_bl.contents_equal(read_bl));
+-  }
+-}
+-
+-TEST_F(TestLibRBD, LUKS2UnderLUKS1WithoutResize)
+-{
+-  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
+-
+-  librados::IoCtx ioctx;
+-  ASSERT_EQ(0, _rados.ioctx_create(m_pool_name.c_str(), ioctx));
+-
+-  librbd::RBD rbd;
+-  std::string parent_name = get_temp_image_name();
+-  std::string clone_name = get_temp_image_name();
+-  uint64_t data_size = 25 << 20;
+-  uint64_t luks1_meta_size = 4 << 20;
+-  uint64_t luks2_meta_size = 16 << 20;
+-  std::string parent_passphrase = "parent passphrase";
+-  std::string clone_passphrase = "clone passphrase";
+-
+-  {
+-    int order = 22;
+-    ASSERT_EQ(0, create_image_pp(rbd, ioctx, parent_name.c_str(),
+-                                 luks2_meta_size + data_size, &order));
+-    librbd::Image parent;
+-    ASSERT_EQ(0, rbd.open(ioctx, parent, parent_name.c_str(), nullptr));
+-
+-    librbd::encryption_luks2_format_options_t fopts = {
+-        RBD_ENCRYPTION_ALGORITHM_AES256, parent_passphrase};
+-    ASSERT_EQ(0, parent.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS2, &fopts,
+-                                          sizeof(fopts)));
+-
+-    ceph::bufferlist bl;
+-    bl.append(std::string(data_size, 'a'));
+-    ASSERT_EQ(data_size, parent.write(0, data_size, bl));
+-
+-    ASSERT_EQ(0, parent.snap_create("snap"));
+-    ASSERT_EQ(0, parent.snap_protect("snap"));
+-    uint64_t features;
+-    ASSERT_EQ(0, parent.features(&features));
+-    ASSERT_EQ(0, rbd.clone(ioctx, parent_name.c_str(), "snap", ioctx,
+-                           clone_name.c_str(), features, &order));
+-  }
+-
+-  {
+-    librbd::Image clone;
+-    ASSERT_EQ(0, rbd.open(ioctx, clone, clone_name.c_str(), nullptr));
+-
+-    librbd::encryption_luks1_format_options_t fopts =
+-        {RBD_ENCRYPTION_ALGORITHM_AES256, clone_passphrase};
+-    ASSERT_EQ(0, clone.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS1, &fopts,
+-                                         sizeof(fopts)));
+-
+-    librbd::encryption_luks_format_options_t opts1 = {parent_passphrase};
+-    librbd::encryption_luks_format_options_t opts2 = {clone_passphrase};
+-    librbd::encryption_spec_t specs[] = {
+-        {RBD_ENCRYPTION_FORMAT_LUKS, &opts2, sizeof(opts2)},
+-        {RBD_ENCRYPTION_FORMAT_LUKS, &opts1, sizeof(opts1)}};
+-    ASSERT_EQ(0, clone.encryption_load2(specs, std::size(specs)));
+-
+-    uint64_t size;
+-    ASSERT_EQ(0, clone.size(&size));
+-    EXPECT_EQ(data_size + luks2_meta_size - luks1_meta_size, size);
+-    uint64_t overlap;
+-    ASSERT_EQ(0, clone.overlap(&overlap));
+-    EXPECT_EQ(data_size, overlap);
+-
+-    ceph::bufferlist expected_bl;
+-    expected_bl.append(std::string(data_size, 'a'));
+-    expected_bl.append_zero(luks2_meta_size - luks1_meta_size);
+-
+-    ceph::bufferlist read_bl;
+-    ASSERT_EQ(expected_bl.length(),
+-              clone.read(0, expected_bl.length(), read_bl));
+-    EXPECT_TRUE(expected_bl.contents_equal(read_bl));
+-  }
+-}
+-
+-TEST_F(TestLibRBD, EncryptionFormatNoData)
+-{
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
+-
+-  librados::IoCtx ioctx;
+-  ASSERT_EQ(0, _rados.ioctx_create(m_pool_name.c_str(), ioctx));
+-
+-  librbd::RBD rbd;
+-  auto name = get_temp_image_name();
+-  uint64_t luks1_meta_size = 4 << 20;
+-  std::string passphrase = "some passphrase";
+-
+-  {
+-    int order = 0;
+-    ASSERT_EQ(0, create_image_pp(rbd, ioctx, name.c_str(), luks1_meta_size - 1,
+-                                 &order));
+-    librbd::Image image;
+-    ASSERT_EQ(0, rbd.open(ioctx, image, name.c_str(), nullptr));
+-
+-    librbd::encryption_luks1_format_options_t opts = {
+-        RBD_ENCRYPTION_ALGORITHM_AES256, passphrase};
+-    ASSERT_EQ(-ENOSPC, image.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS1,
+-                                               &opts, sizeof(opts)));
+-    uint64_t size;
+-    ASSERT_EQ(0, image.size(&size));
+-    ASSERT_EQ(luks1_meta_size - 1, size);
+-  }
+-
+-  {
+-    librbd::Image image;
+-    ASSERT_EQ(0, rbd.open(ioctx, image, name.c_str(), nullptr));
+-    ASSERT_EQ(0, image.resize(luks1_meta_size));
+-
+-    librbd::encryption_luks1_format_options_t opts = {
+-        RBD_ENCRYPTION_ALGORITHM_AES256, passphrase};
+-    ASSERT_EQ(0, image.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS1, &opts,
+-                                         sizeof(opts)));
+-    uint64_t size;
+-    ASSERT_EQ(0, image.size(&size));
+-    ASSERT_EQ(0, size);
+-  }
+-}
+-
+-TEST_F(TestLibRBD, EncryptionLoadBadSize)
+-{
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
+-
+-  librados::IoCtx ioctx;
+-  ASSERT_EQ(0, _rados.ioctx_create(m_pool_name.c_str(), ioctx));
+-
+-  librbd::RBD rbd;
+-  auto name = get_temp_image_name();
+-  uint64_t luks1_meta_size = 4 << 20;
+-  std::string passphrase = "some passphrase";
+-
+-  {
+-    int order = 0;
+-    ASSERT_EQ(0, create_image_pp(rbd, ioctx, name.c_str(), luks1_meta_size,
+-                                 &order));
+-    librbd::Image image;
+-    ASSERT_EQ(0, rbd.open(ioctx, image, name.c_str(), nullptr));
+-
+-    librbd::encryption_luks1_format_options_t opts = {
+-        RBD_ENCRYPTION_ALGORITHM_AES256, passphrase};
+-    ASSERT_EQ(0, image.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS1, &opts,
+-                                         sizeof(opts)));
+-  }
+-
+-  {
+-    librbd::Image image;
+-    ASSERT_EQ(0, rbd.open(ioctx, image, name.c_str(), nullptr));
+-
+-    librbd::encryption_luks_format_options_t opts = {passphrase};
+-    ASSERT_EQ(0, image.encryption_load(RBD_ENCRYPTION_FORMAT_LUKS, &opts,
+-                                       sizeof(opts)));
+-    uint64_t size;
+-    ASSERT_EQ(0, image.size(&size));
+-    ASSERT_EQ(0, size);
+-  }
+-
+-  {
+-    librbd::Image image;
+-    ASSERT_EQ(0, rbd.open(ioctx, image, name.c_str(), nullptr));
+-    ASSERT_EQ(0, image.resize(luks1_meta_size - 1));
+-
+-    librbd::encryption_luks_format_options_t opts = {passphrase};
+-    ASSERT_EQ(-EINVAL, image.encryption_load(RBD_ENCRYPTION_FORMAT_LUKS, &opts,
+-                                             sizeof(opts)));
+-    uint64_t size;
+-    ASSERT_EQ(0, image.size(&size));
+-    ASSERT_EQ(luks1_meta_size - 1, size);
+-  }
+-}
+-
+-TEST_F(TestLibRBD, EncryptionLoadBadStripePattern)
+-{
+-  REQUIRE_FEATURE(RBD_FEATURE_STRIPINGV2);
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
+-
+-  librados::IoCtx ioctx;
+-  ASSERT_EQ(0, _rados.ioctx_create(m_pool_name.c_str(), ioctx));
+-
+-  bool old_format;
+-  uint64_t features;
+-  ASSERT_EQ(0, get_features(&old_format, &features));
+-  ASSERT_FALSE(old_format);
+-
+-  librbd::RBD rbd;
+-  auto name1 = get_temp_image_name();
+-  auto name2 = get_temp_image_name();
+-  auto name3 = get_temp_image_name();
+-  std::string passphrase = "some passphrase";
+-
+-  {
+-    int order = 22;
+-    ASSERT_EQ(0, rbd.create3(ioctx, name1.c_str(), 20 << 20, features, &order,
+-                             2 << 20, 2));
+-    librbd::Image image;
+-    ASSERT_EQ(0, rbd.open(ioctx, image, name1.c_str(), nullptr));
+-
+-    librbd::encryption_luks1_format_options_t opts = {
+-        RBD_ENCRYPTION_ALGORITHM_AES256, passphrase};
+-    ASSERT_EQ(0, image.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS1, &opts,
+-                                         sizeof(opts)));
+-    uint64_t size;
+-    ASSERT_EQ(0, image.size(&size));
+-    ASSERT_EQ(12 << 20, size);
+-  }
+-
+-  {
+-    librbd::Image image;
+-    ASSERT_EQ(0, rbd.open(ioctx, image, name1.c_str(), nullptr));
+-
+-    // different but compatible striping pattern
+-    librbd::ImageOptions image_opts;
+-    ASSERT_EQ(0, image_opts.set(RBD_IMAGE_OPTION_STRIPE_UNIT, 1 << 20));
+-    ASSERT_EQ(0, image_opts.set(RBD_IMAGE_OPTION_STRIPE_COUNT, 2));
+-    ASSERT_EQ(0, image.deep_copy(ioctx, name2.c_str(), image_opts));
+-  }
+-  {
+-    librbd::Image image;
+-    ASSERT_EQ(0, rbd.open(ioctx, image, name2.c_str(), nullptr));
+-
+-    librbd::encryption_luks_format_options_t opts = {passphrase};
+-    ASSERT_EQ(0, image.encryption_load(RBD_ENCRYPTION_FORMAT_LUKS, &opts,
+-                                       sizeof(opts)));
+-    uint64_t size;
+-    ASSERT_EQ(0, image.size(&size));
+-    ASSERT_EQ(12 << 20, size);
+-  }
+-
+-  {
+-    librbd::Image image;
+-    ASSERT_EQ(0, rbd.open(ioctx, image, name1.c_str(), nullptr));
+-
+-    // incompatible striping pattern
+-    librbd::ImageOptions image_opts;
+-    ASSERT_EQ(0, image_opts.set(RBD_IMAGE_OPTION_STRIPE_UNIT, 1 << 20));
+-    ASSERT_EQ(0, image_opts.set(RBD_IMAGE_OPTION_STRIPE_COUNT, 3));
+-    ASSERT_EQ(0, image.deep_copy(ioctx, name3.c_str(), image_opts));
+-  }
+-  {
+-    librbd::Image image;
+-    ASSERT_EQ(0, rbd.open(ioctx, image, name3.c_str(), nullptr));
+-
+-    librbd::encryption_luks_format_options_t opts = {passphrase};
+-    ASSERT_EQ(-EINVAL, image.encryption_load(RBD_ENCRYPTION_FORMAT_LUKS, &opts,
+-                                             sizeof(opts)));
+-    uint64_t size;
+-    ASSERT_EQ(0, image.size(&size));
+-    ASSERT_EQ(20 << 20, size);
+-  }
+-}
+-
+-TEST_F(TestLibRBD, EncryptionLoadFormatMismatch)
+-{
+-  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
+-
+-  librados::IoCtx ioctx;
+-  ASSERT_EQ(0, _rados.ioctx_create(m_pool_name.c_str(), ioctx));
+-
+-  librbd::RBD rbd;
+-  std::string name1 = get_temp_image_name();
+-  std::string name2 = get_temp_image_name();
+-  std::string name3 = get_temp_image_name();
+-  std::string passphrase = "some passphrase";
+-
+-  librbd::encryption_luks1_format_options_t luks1_opts = {
+-      RBD_ENCRYPTION_ALGORITHM_AES256, passphrase};
+-  librbd::encryption_luks2_format_options_t luks2_opts = {
+-      RBD_ENCRYPTION_ALGORITHM_AES256, passphrase};
+-  librbd::encryption_luks_format_options_t luks_opts = {passphrase};
+-
+-#define LUKS_ONE {RBD_ENCRYPTION_FORMAT_LUKS1, &luks1_opts, sizeof(luks1_opts)}
+-#define LUKS_TWO {RBD_ENCRYPTION_FORMAT_LUKS2, &luks2_opts, sizeof(luks2_opts)}
+-#define LUKS_ANY {RBD_ENCRYPTION_FORMAT_LUKS, &luks_opts, sizeof(luks_opts)}
+-
+-  const std::vector<librbd::encryption_spec_t> bad_specs[] = {
+-      {},
+-      {LUKS_ONE},
+-      {LUKS_TWO},
+-      {LUKS_ONE, LUKS_ONE},
+-      {LUKS_ONE, LUKS_TWO},
+-      {LUKS_ONE, LUKS_ANY},
+-      {LUKS_TWO, LUKS_TWO},
+-      {LUKS_ANY, LUKS_TWO},
+-      {LUKS_ONE, LUKS_ONE, LUKS_ONE},
+-      {LUKS_ONE, LUKS_ONE, LUKS_TWO},
+-      {LUKS_ONE, LUKS_ONE, LUKS_ANY},
+-      {LUKS_ONE, LUKS_TWO, LUKS_ONE},
+-      {LUKS_ONE, LUKS_TWO, LUKS_TWO},
+-      {LUKS_ONE, LUKS_TWO, LUKS_ANY},
+-      {LUKS_ONE, LUKS_ANY, LUKS_ONE},
+-      {LUKS_ONE, LUKS_ANY, LUKS_TWO},
+-      {LUKS_ONE, LUKS_ANY, LUKS_ANY},
+-      {LUKS_TWO, LUKS_ONE, LUKS_TWO},
+-      {LUKS_TWO, LUKS_TWO, LUKS_ONE},
+-      {LUKS_TWO, LUKS_TWO, LUKS_TWO},
+-      {LUKS_TWO, LUKS_TWO, LUKS_ANY},
+-      {LUKS_TWO, LUKS_ANY, LUKS_TWO},
+-      {LUKS_ANY, LUKS_ONE, LUKS_TWO},
+-      {LUKS_ANY, LUKS_TWO, LUKS_ONE},
+-      {LUKS_ANY, LUKS_TWO, LUKS_TWO},
+-      {LUKS_ANY, LUKS_TWO, LUKS_ANY},
+-      {LUKS_ANY, LUKS_ANY, LUKS_TWO},
+-      {LUKS_ANY, LUKS_ANY, LUKS_ANY, LUKS_ANY}};
+-
+-  const std::vector<librbd::encryption_spec_t> good_specs[] = {
+-      {LUKS_ANY},
+-      {LUKS_TWO, LUKS_ONE},
+-      {LUKS_TWO, LUKS_ANY},
+-      {LUKS_ANY, LUKS_ONE},
+-      {LUKS_ANY, LUKS_ANY},
+-      {LUKS_TWO, LUKS_ONE, LUKS_ONE},
+-      {LUKS_TWO, LUKS_ONE, LUKS_ANY},
+-      {LUKS_TWO, LUKS_ANY, LUKS_ONE},
+-      {LUKS_TWO, LUKS_ANY, LUKS_ANY},
+-      {LUKS_ANY, LUKS_ONE, LUKS_ONE},
+-      {LUKS_ANY, LUKS_ONE, LUKS_ANY},
+-      {LUKS_ANY, LUKS_ANY, LUKS_ONE},
+-      {LUKS_ANY, LUKS_ANY, LUKS_ANY}};
+-
+-  static_assert(std::size(bad_specs) + std::size(good_specs) == 1 + 3 + 9 + 27 + 1);
+-
+-#undef LUKS_ONE
+-#undef LUKS_TWO
+-#undef LUKS_ANY
+-
+-  {
+-    int order = 0;
+-    ASSERT_EQ(0, create_image_pp(rbd, ioctx, name1.c_str(), 20 << 20, &order));
+-    librbd::Image image1;
+-    ASSERT_EQ(0, rbd.open(ioctx, image1, name1.c_str(), nullptr));
+-    ASSERT_EQ(0, image1.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS1,
+-                                          &luks1_opts, sizeof(luks1_opts)));
+-
+-    ASSERT_EQ(0, image1.snap_create("snap"));
+-    ASSERT_EQ(0, image1.snap_protect("snap"));
+-    uint64_t features;
+-    ASSERT_EQ(0, image1.features(&features));
+-    ASSERT_EQ(0, rbd.clone(ioctx, name1.c_str(), "snap", ioctx, name2.c_str(),
+-                           features, &order));
+-
+-    librbd::Image image2;
+-    ASSERT_EQ(0, rbd.open(ioctx, image2, name2.c_str(), nullptr));
+-    ASSERT_EQ(0, image2.snap_create("snap"));
+-    ASSERT_EQ(0, image2.snap_protect("snap"));
+-    ASSERT_EQ(0, rbd.clone(ioctx, name2.c_str(), "snap", ioctx, name3.c_str(),
+-                           features, &order));
+-
+-    librbd::Image image3;
+-    ASSERT_EQ(0, rbd.open(ioctx, image3, name3.c_str(), nullptr));
+-    ASSERT_EQ(0, image3.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS2,
+-                                          &luks2_opts, sizeof(luks2_opts)));
+-  }
+-
+-  {
+-    librbd::Image image3;
+-    ASSERT_EQ(0, rbd.open(ioctx, image3, name3.c_str(), nullptr));
+-    for (auto& specs : bad_specs) {
+-      ASSERT_EQ(-EINVAL, image3.encryption_load2(specs.data(), specs.size()));
+-    }
+-  }
+-
+-  for (auto& specs : good_specs) {
+-    librbd::Image image3;
+-    ASSERT_EQ(0, rbd.open(ioctx, image3, name3.c_str(), nullptr));
+-    ASSERT_EQ(0, image3.encryption_load2(specs.data(), specs.size()));
+-  }
+-}
+-
+-TEST_F(TestLibRBD, EncryptedResize)
+-{
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
+-
+-  librados::IoCtx ioctx;
+-  ASSERT_EQ(0, _rados.ioctx_create(m_pool_name.c_str(), ioctx));
+-
+-  librbd::RBD rbd;
+-  auto name = get_temp_image_name();
+-  uint64_t luks2_meta_size = 16 << 20;
+-  uint64_t data_size = 10 << 20;
+-  std::string passphrase = "some passphrase";
+-
+-  {
+-    int order = 0;
+-    ASSERT_EQ(0, create_image_pp(rbd, ioctx, name.c_str(),
+-                                 luks2_meta_size + data_size, &order));
+-    librbd::Image image;
+-    ASSERT_EQ(0, rbd.open(ioctx, image, name.c_str(), nullptr));
+-
+-    uint64_t size;
+-    ASSERT_EQ(0, image.size(&size));
+-    ASSERT_EQ(luks2_meta_size + data_size, size);
+-
+-    librbd::encryption_luks2_format_options_t opts = {
+-        RBD_ENCRYPTION_ALGORITHM_AES256, passphrase};
+-    ASSERT_EQ(0, image.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS2, &opts,
+-                                         sizeof(opts)));
+-    ASSERT_EQ(0, image.size(&size));
+-    ASSERT_EQ(data_size, size);
+-    ASSERT_EQ(0, image.resize(data_size * 3));
+-    ASSERT_EQ(0, image.size(&size));
+-    ASSERT_EQ(data_size * 3, size);
+-  }
+-
+-  {
+-    librbd::Image image;
+-    ASSERT_EQ(0, rbd.open(ioctx, image, name.c_str(), nullptr));
+-
+-    uint64_t size;
+-    ASSERT_EQ(0, image.size(&size));
+-    ASSERT_EQ(luks2_meta_size + data_size * 3, size);
+-
+-    librbd::encryption_luks_format_options_t opts = {passphrase};
+-    ASSERT_EQ(0, image.encryption_load(RBD_ENCRYPTION_FORMAT_LUKS, &opts,
+-                                       sizeof(opts)));
+-    ASSERT_EQ(0, image.size(&size));
+-    ASSERT_EQ(data_size * 3, size);
+-    ASSERT_EQ(0, image.resize(data_size / 2));
+-    ASSERT_EQ(0, image.size(&size));
+-    ASSERT_EQ(data_size / 2, size);
+-  }
+-
+-  {
+-    librbd::Image image;
+-    ASSERT_EQ(0, rbd.open(ioctx, image, name.c_str(), nullptr));
+-
+-    uint64_t size;
+-    ASSERT_EQ(0, image.size(&size));
+-    ASSERT_EQ(luks2_meta_size + data_size / 2, size);
+-
+-    librbd::encryption_luks_format_options_t opts = {passphrase};
+-    ASSERT_EQ(0, image.encryption_load(RBD_ENCRYPTION_FORMAT_LUKS, &opts,
+-                                       sizeof(opts)));
+-    ASSERT_EQ(0, image.size(&size));
+-    ASSERT_EQ(data_size / 2, size);
+-    ASSERT_EQ(0, image.resize(0));
+-    ASSERT_EQ(0, image.size(&size));
+-    ASSERT_EQ(0, size);
+-  }
+-
+-  {
+-    librbd::Image image;
+-    ASSERT_EQ(0, rbd.open(ioctx, image, name.c_str(), nullptr));
+-
+-    uint64_t size;
+-    ASSERT_EQ(0, image.size(&size));
+-    ASSERT_EQ(luks2_meta_size, size);
+-
+-    librbd::encryption_luks_format_options_t opts = {passphrase};
+-    ASSERT_EQ(0, image.encryption_load(RBD_ENCRYPTION_FORMAT_LUKS, &opts,
+-                                       sizeof(opts)));
+-    ASSERT_EQ(0, image.size(&size));
+-    ASSERT_EQ(0, size);
+-    ASSERT_EQ(0, image.resize(data_size));
+-    ASSERT_EQ(0, image.size(&size));
+-    ASSERT_EQ(data_size, size);
+-  }
+-
+-  {
+-    librbd::Image image;
+-    ASSERT_EQ(0, rbd.open(ioctx, image, name.c_str(), nullptr));
+-
+-    uint64_t size;
+-    ASSERT_EQ(0, image.size(&size));
+-    ASSERT_EQ(luks2_meta_size + data_size, size);
+-  }
+-}
+-
+-TEST_F(TestLibRBD, EncryptedFlattenSmallData)
+-{
+-  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
+-
+-  librados::IoCtx ioctx;
+-  ASSERT_EQ(0, _rados.ioctx_create(m_pool_name.c_str(), ioctx));
+-
+-  librbd::RBD rbd;
+-  std::string parent_name = get_temp_image_name();
+-  std::string clone_name = get_temp_image_name();
+-  uint64_t data_size = 5000;
+-  uint64_t luks2_meta_size = 16 << 20;
+-  std::string passphrase = "some passphrase";
+-
+-  {
+-    int order = 22;
+-    ASSERT_EQ(0, create_image_pp(rbd, ioctx, parent_name.c_str(),
+-                                 luks2_meta_size + data_size, &order));
+-    librbd::Image parent;
+-    ASSERT_EQ(0, rbd.open(ioctx, parent, parent_name.c_str(), nullptr));
+-
+-    librbd::encryption_luks2_format_options_t opts = {
+-        RBD_ENCRYPTION_ALGORITHM_AES256, passphrase};
+-    ASSERT_EQ(0, parent.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS2, &opts,
+-                                          sizeof(opts)));
+-
+-    ceph::bufferlist bl;
+-    bl.append(std::string(data_size, 'a'));
+-    ASSERT_EQ(data_size, parent.write(0, data_size, bl));
+-
+-    ASSERT_EQ(0, parent.snap_create("snap"));
+-    ASSERT_EQ(0, parent.snap_protect("snap"));
+-    uint64_t features;
+-    ASSERT_EQ(0, parent.features(&features));
+-    ASSERT_EQ(0, rbd.clone(ioctx, parent_name.c_str(), "snap", ioctx,
+-                           clone_name.c_str(), features, &order));
+-  }
+-
+-  {
+-    librbd::Image clone;
+-    ASSERT_EQ(0, rbd.open(ioctx, clone, clone_name.c_str(), nullptr));
+-
+-    librbd::encryption_luks_format_options_t opts = {passphrase};
+-    ASSERT_EQ(0, clone.encryption_load(RBD_ENCRYPTION_FORMAT_LUKS, &opts,
+-                                       sizeof(opts)));
+-    uint64_t size;
+-    ASSERT_EQ(0, clone.size(&size));
+-    ASSERT_EQ(data_size, size);
+-    uint64_t overlap;
+-    ASSERT_EQ(0, clone.overlap(&overlap));
+-    ASSERT_EQ(data_size, overlap);
+-
+-    ceph::bufferlist expected_bl;
+-    expected_bl.append(std::string(data_size, 'a'));
+-
+-    ceph::bufferlist read_bl1;
+-    ASSERT_EQ(data_size, clone.read(0, data_size, read_bl1));
+-    ASSERT_TRUE(expected_bl.contents_equal(read_bl1));
+-
+-    ASSERT_EQ(0, clone.flatten());
+-
+-    ceph::bufferlist read_bl2;
+-    ASSERT_EQ(data_size, clone.read(0, data_size, read_bl2));
+-    ASSERT_TRUE(expected_bl.contents_equal(read_bl2));
+-  }
+-
+-  {
+-    librbd::Image clone;
+-    ASSERT_EQ(0, rbd.open(ioctx, clone, clone_name.c_str(), nullptr));
+-
+-    librbd::encryption_luks_format_options_t opts = {passphrase};
+-    ASSERT_EQ(0, clone.encryption_load(RBD_ENCRYPTION_FORMAT_LUKS, &opts,
+-                                       sizeof(opts)));
+-    uint64_t size;
+-    ASSERT_EQ(0, clone.size(&size));
+-    ASSERT_EQ(data_size, size);
+-    uint64_t overlap;
+-    ASSERT_EQ(0, clone.overlap(&overlap));
+-    ASSERT_EQ(0, overlap);
+-
+-    ceph::bufferlist expected_bl;
+-    expected_bl.append(std::string(data_size, 'a'));
+-
+-    ceph::bufferlist read_bl;
+-    ASSERT_EQ(data_size, clone.read(0, data_size, read_bl));
+-    ASSERT_TRUE(expected_bl.contents_equal(read_bl));
+-  }
+-}
+-
+-struct LUKSOnePassphrase {
+-  int load(librbd::Image& clone) {
+-    librbd::encryption_luks_format_options_t opts = {m_passphrase};
+-    return clone.encryption_load(RBD_ENCRYPTION_FORMAT_LUKS, &opts,
+-                                 sizeof(opts));
+-  }
+-
+-  int load_flattened(librbd::Image& clone) {
+-    return load(clone);
+-  }
+-
+-  std::string m_passphrase = "some passphrase";
+-};
+-
+-struct LUKSTwoPassphrases {
+-  int load(librbd::Image& clone) {
+-    librbd::encryption_luks_format_options_t opts1 = {m_parent_passphrase};
+-    librbd::encryption_luks_format_options_t opts2 = {m_clone_passphrase};
+-    librbd::encryption_spec_t specs[] = {
+-        {RBD_ENCRYPTION_FORMAT_LUKS, &opts2, sizeof(opts2)},
+-        {RBD_ENCRYPTION_FORMAT_LUKS, &opts1, sizeof(opts1)}};
+-    return clone.encryption_load2(specs, std::size(specs));
+-  }
+-
+-  int load_flattened(librbd::Image& clone) {
+-    librbd::encryption_luks_format_options_t opts = {m_clone_passphrase};
+-    return clone.encryption_load(RBD_ENCRYPTION_FORMAT_LUKS, &opts,
+-                                 sizeof(opts));
+-  }
+-
+-  std::string m_parent_passphrase = "parent passphrase";
+-  std::string m_clone_passphrase = "clone passphrase";
+-};
+-
+-struct PlaintextUnderLUKS1 : LUKSOnePassphrase {
+-protected:
+-  void setup_parent(librbd::Image& parent, uint64_t data_size, bool* passed) {
+-    ceph::bufferlist bl;
+-    bl.append(std::string(data_size, 'a'));
+-    ASSERT_EQ(data_size, parent.write(0, data_size, bl));
+-
+-    // before taking a parent snapshot, (temporarily) add extra space
+-    // to the parent to account for upcoming LUKS1 header in the clone,
+-    // making the clone able to reach all parent data
+-    uint64_t luks1_meta_size = 4 << 20;
+-    ASSERT_EQ(0, parent.resize(data_size + luks1_meta_size));
+-    *passed = true;
+-  }
+-
+-  void setup_clone(librbd::Image& clone, uint64_t data_size, bool* passed) {
+-    librbd::encryption_luks1_format_options_t fopts =
+-        {RBD_ENCRYPTION_ALGORITHM_AES256, m_passphrase};
+-    ASSERT_EQ(0, clone.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS1, &fopts,
+-                                         sizeof(fopts)));
+-    *passed = true;
+-  }
+-};
+-
+-struct PlaintextUnderLUKS2 : LUKSOnePassphrase {
+-  void setup_parent(librbd::Image& parent, uint64_t data_size, bool* passed) {
+-    ceph::bufferlist bl;
+-    bl.append(std::string(data_size, 'a'));
+-    ASSERT_EQ(data_size, parent.write(0, data_size, bl));
+-
+-    // before taking a parent snapshot, (temporarily) add extra space
+-    // to the parent to account for upcoming LUKS2 header in the clone,
+-    // making the clone able to reach all parent data
+-    uint64_t luks2_meta_size = 16 << 20;
+-    ASSERT_EQ(0, parent.resize(data_size + luks2_meta_size));
+-    *passed = true;
+-  }
+-
+-  void setup_clone(librbd::Image& clone, uint64_t data_size, bool* passed) {
+-    librbd::encryption_luks2_format_options_t fopts =
+-        {RBD_ENCRYPTION_ALGORITHM_AES256, m_passphrase};
+-    ASSERT_EQ(0, clone.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS2, &fopts,
+-                                         sizeof(fopts)));
+-    *passed = true;
+-  }
+-};
+-
+-struct UnformattedLUKS1 : LUKSOnePassphrase {
+-  void setup_parent(librbd::Image& parent, uint64_t data_size, bool* passed) {
+-    uint64_t luks1_meta_size = 4 << 20;
+-    ASSERT_EQ(0, parent.resize(data_size + luks1_meta_size));
+-    librbd::encryption_luks1_format_options_t fopts = {
+-        RBD_ENCRYPTION_ALGORITHM_AES256, m_passphrase};
+-    ASSERT_EQ(0, parent.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS1, &fopts,
+-                                          sizeof(fopts)));
+-
+-    ceph::bufferlist bl;
+-    bl.append(std::string(data_size, 'a'));
+-    ASSERT_EQ(data_size, parent.write(0, data_size, bl));
+-    *passed = true;
+-  }
+-
+-  void setup_clone(librbd::Image& clone, uint64_t data_size, bool* passed) {
+-    *passed = true;
+-  }
+-};
+-
+-struct LUKS1UnderLUKS1 : LUKSTwoPassphrases {
+-  void setup_parent(librbd::Image& parent, uint64_t data_size, bool* passed) {
+-    uint64_t luks1_meta_size = 4 << 20;
+-    ASSERT_EQ(0, parent.resize(data_size + luks1_meta_size));
+-    librbd::encryption_luks1_format_options_t fopts = {
+-        RBD_ENCRYPTION_ALGORITHM_AES256, m_parent_passphrase};
+-    ASSERT_EQ(0, parent.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS1, &fopts,
+-                                          sizeof(fopts)));
+-
+-    ceph::bufferlist bl;
+-    bl.append(std::string(data_size, 'a'));
+-    ASSERT_EQ(data_size, parent.write(0, data_size, bl));
+-    *passed = true;
+-  }
+-
+-  void setup_clone(librbd::Image& clone, uint64_t data_size, bool* passed) {
+-    librbd::encryption_luks1_format_options_t fopts =
+-        {RBD_ENCRYPTION_ALGORITHM_AES256, m_clone_passphrase};
+-    ASSERT_EQ(0, clone.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS1, &fopts,
+-                                         sizeof(fopts)));
+-    *passed = true;
+-  }
+-};
+-
+-struct LUKS1UnderLUKS2 : LUKSTwoPassphrases {
+-  void setup_parent(librbd::Image& parent, uint64_t data_size, bool* passed) {
+-    uint64_t luks1_meta_size = 4 << 20;
+-    ASSERT_EQ(0, parent.resize(data_size + luks1_meta_size));
+-    librbd::encryption_luks1_format_options_t fopts = {
+-        RBD_ENCRYPTION_ALGORITHM_AES256, m_parent_passphrase};
+-    ASSERT_EQ(0, parent.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS1, &fopts,
+-                                          sizeof(fopts)));
+-
+-    ceph::bufferlist bl;
+-    bl.append(std::string(data_size, 'a'));
+-    ASSERT_EQ(data_size, parent.write(0, data_size, bl));
+-
+-    // before taking a parent snapshot, (temporarily) add extra space
+-    // to the parent to account for upcoming LUKS2 header in the clone,
+-    // making the clone able to reach all parent data
+-    // space taken by LUKS1 header in the parent would be reused
+-    uint64_t luks2_meta_size = 16 << 20;
+-    ASSERT_EQ(0, parent.resize(data_size + luks2_meta_size - luks1_meta_size));
+-    *passed = true;
+-  }
+-
+-  void setup_clone(librbd::Image& clone, uint64_t data_size, bool* passed) {
+-    librbd::encryption_luks2_format_options_t fopts =
+-        {RBD_ENCRYPTION_ALGORITHM_AES256, m_clone_passphrase};
+-    ASSERT_EQ(0, clone.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS2, &fopts,
+-                                         sizeof(fopts)));
+-    *passed = true;
+-  }
+-};
+-
+-struct UnformattedLUKS2 : LUKSOnePassphrase {
+-  void setup_parent(librbd::Image& parent, uint64_t data_size, bool* passed) {
+-    uint64_t luks2_meta_size = 16 << 20;
+-    ASSERT_EQ(0, parent.resize(data_size + luks2_meta_size));
+-    librbd::encryption_luks2_format_options_t fopts = {
+-        RBD_ENCRYPTION_ALGORITHM_AES256, m_passphrase};
+-    ASSERT_EQ(0, parent.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS2, &fopts,
+-                                          sizeof(fopts)));
+-
+-    ceph::bufferlist bl;
+-    bl.append(std::string(data_size, 'a'));
+-    ASSERT_EQ(data_size, parent.write(0, data_size, bl));
+-    *passed = true;
+-  }
+-
+-  void setup_clone(librbd::Image& clone, uint64_t data_size, bool* passed) {
+-    *passed = true;
+-  }
+-};
+-
+-struct LUKS2UnderLUKS2 : LUKSTwoPassphrases {
+-  void setup_parent(librbd::Image& parent, uint64_t data_size, bool* passed) {
+-    uint64_t luks2_meta_size = 16 << 20;
+-    ASSERT_EQ(0, parent.resize(data_size + luks2_meta_size));
+-    librbd::encryption_luks2_format_options_t fopts = {
+-        RBD_ENCRYPTION_ALGORITHM_AES256, m_parent_passphrase};
+-    ASSERT_EQ(0, parent.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS2, &fopts,
+-                                          sizeof(fopts)));
+-
+-    ceph::bufferlist bl;
+-    bl.append(std::string(data_size, 'a'));
+-    ASSERT_EQ(data_size, parent.write(0, data_size, bl));
+-    *passed = true;
+-  }
+-
+-  void setup_clone(librbd::Image& clone, uint64_t data_size, bool* passed) {
+-    librbd::encryption_luks2_format_options_t fopts =
+-        {RBD_ENCRYPTION_ALGORITHM_AES256, m_clone_passphrase};
+-    ASSERT_EQ(0, clone.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS2, &fopts,
+-                                         sizeof(fopts)));
+-    *passed = true;
+-  }
+-};
+-
+-struct LUKS2UnderLUKS1 : LUKSTwoPassphrases {
+-  void setup_parent(librbd::Image& parent, uint64_t data_size, bool* passed) {
+-    uint64_t luks2_meta_size = 16 << 20;
+-    ASSERT_EQ(0, parent.resize(data_size + luks2_meta_size));
+-    librbd::encryption_luks2_format_options_t fopts = {
+-        RBD_ENCRYPTION_ALGORITHM_AES256, m_parent_passphrase};
+-    ASSERT_EQ(0, parent.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS2, &fopts,
+-                                          sizeof(fopts)));
+-
+-    ceph::bufferlist bl;
+-    bl.append(std::string(data_size, 'a'));
+-    ASSERT_EQ(data_size, parent.write(0, data_size, bl));
+-    *passed = true;
+-  }
+-
+-  void setup_clone(librbd::Image& clone, uint64_t data_size, bool* passed) {
+-    librbd::encryption_luks1_format_options_t fopts =
+-        {RBD_ENCRYPTION_ALGORITHM_AES256, m_clone_passphrase};
+-    ASSERT_EQ(0, clone.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS1, &fopts,
+-                                         sizeof(fopts)));
+-
+-    // after loading encryption on the clone, one can get rid of
+-    // unneeded space allowance in the clone arising from LUKS2 header
+-    // in the parent being bigger than LUKS1 header in the clone
+-    ASSERT_EQ(0, load(clone));
+-    ASSERT_EQ(0, clone.resize(data_size));
+-    *passed = true;
+-  }
+-};
+-
+-template <typename FormatPolicy>
+-class EncryptedFlattenTest : public TestLibRBD, FormatPolicy {
+-protected:
+-  void create_and_setup(bool* passed) {
+-    ASSERT_EQ(0, _rados.ioctx_create(m_pool_name.c_str(), m_ioctx));
+-
+-    int order = 22;
+-    ASSERT_EQ(0, create_image_pp(m_rbd, m_ioctx, m_parent_name.c_str(),
+-                                 m_data_size, &order));
+-    librbd::Image parent;
+-    ASSERT_EQ(0, m_rbd.open(m_ioctx, parent, m_parent_name.c_str(), nullptr));
+-    ASSERT_PASSED(FormatPolicy::setup_parent, parent, m_data_size);
+-
+-    ASSERT_EQ(0, parent.snap_create("snap"));
+-    ASSERT_EQ(0, parent.snap_protect("snap"));
+-    uint64_t features;
+-    ASSERT_EQ(0, parent.features(&features));
+-    ASSERT_EQ(0, m_rbd.clone(m_ioctx, m_parent_name.c_str(), "snap", m_ioctx,
+-                             m_clone_name.c_str(), features, &order));
+-    librbd::Image clone;
+-    ASSERT_EQ(0, m_rbd.open(m_ioctx, clone, m_clone_name.c_str(), nullptr));
+-    ASSERT_PASSED(FormatPolicy::setup_clone, clone, m_data_size);
+-
+-    *passed = true;
+-  }
+-
+-  void open_and_load(librbd::Image& clone, bool* passed) {
+-    ASSERT_EQ(0, m_rbd.open(m_ioctx, clone, m_clone_name.c_str(), nullptr));
+-    ASSERT_EQ(0, FormatPolicy::load(clone));
+-    *passed = true;
+-  }
+-
+-  void open_and_load_flattened(librbd::Image& clone, bool* passed) {
+-    ASSERT_EQ(0, m_rbd.open(m_ioctx, clone, m_clone_name.c_str(), nullptr));
+-    ASSERT_EQ(0, FormatPolicy::load_flattened(clone));
+-    *passed = true;
+-  }
+-
+-  void verify_size_and_overlap(librbd::Image& image, uint64_t expected_size,
+-                               uint64_t expected_overlap) {
+-    uint64_t size;
+-    ASSERT_EQ(0, image.size(&size));
+-    EXPECT_EQ(expected_size, size);
+-    uint64_t overlap;
+-    ASSERT_EQ(0, image.overlap(&overlap));
+-    EXPECT_EQ(expected_overlap, overlap);
+-  }
+-
+-  void verify_data(librbd::Image& image, const ceph::bufferlist& expected_bl) {
+-    ceph::bufferlist read_bl;
+-    ASSERT_EQ(expected_bl.length(),
+-              image.read(0, expected_bl.length(), read_bl));
+-    EXPECT_TRUE(expected_bl.contents_equal(read_bl));
+-  }
+-
+-  librados::IoCtx m_ioctx;
+-  librbd::RBD m_rbd;
+-  std::string m_parent_name = get_temp_image_name();
+-  std::string m_clone_name = get_temp_image_name();
+-  uint64_t m_data_size = 25 << 20;
+-};
+-
+-using EncryptedFlattenTestTypes =
+-    ::testing::Types<PlaintextUnderLUKS1, PlaintextUnderLUKS2,
+-                     UnformattedLUKS1, LUKS1UnderLUKS1, LUKS1UnderLUKS2,
+-                     UnformattedLUKS2, LUKS2UnderLUKS2, LUKS2UnderLUKS1>;
+-TYPED_TEST_SUITE(EncryptedFlattenTest, EncryptedFlattenTestTypes);
+-
+-TYPED_TEST(EncryptedFlattenTest, Simple)
+-{
+-  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
+-
+-  ASSERT_PASSED0(this->create_and_setup);
+-
+-  ceph::bufferlist expected_bl;
+-  expected_bl.append(std::string(this->m_data_size, 'a'));
+-
+-  {
+-    librbd::Image clone;
+-    ASSERT_PASSED(this->open_and_load, clone);
+-    this->verify_size_and_overlap(clone, this->m_data_size, this->m_data_size);
+-    this->verify_data(clone, expected_bl);
+-    ASSERT_EQ(0, clone.flatten());
+-    this->verify_data(clone, expected_bl);
+-  }
+-
+-  {
+-    librbd::Image clone;
+-    ASSERT_PASSED(this->open_and_load_flattened, clone);
+-    this->verify_size_and_overlap(clone, this->m_data_size, 0);
+-    this->verify_data(clone, expected_bl);
+-  }
+-}
+-
+-TYPED_TEST(EncryptedFlattenTest, Grow)
+-{
+-  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
+-
+-  ASSERT_PASSED0(this->create_and_setup);
+-
+-  ceph::bufferlist expected_bl;
+-  expected_bl.append(std::string(this->m_data_size, 'a'));
+-  expected_bl.append_zero(1);
+-
+-  {
+-    librbd::Image clone;
+-    ASSERT_PASSED(this->open_and_load, clone);
+-    ASSERT_EQ(0, clone.resize(this->m_data_size + 1));
+-    this->verify_size_and_overlap(clone, this->m_data_size + 1,
+-                                  this->m_data_size);
+-    this->verify_data(clone, expected_bl);
+-    ASSERT_EQ(0, clone.flatten());
+-    this->verify_data(clone, expected_bl);
+-  }
+-
+-  {
+-    librbd::Image clone;
+-    ASSERT_PASSED(this->open_and_load_flattened, clone);
+-    this->verify_size_and_overlap(clone, this->m_data_size + 1, 0);
+-    this->verify_data(clone, expected_bl);
+-  }
+-}
+-
+-TYPED_TEST(EncryptedFlattenTest, Shrink)
+-{
+-  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
+-
+-  ASSERT_PASSED0(this->create_and_setup);
+-
+-  ceph::bufferlist expected_bl;
+-  expected_bl.append(std::string(this->m_data_size - 1, 'a'));
+-
+-  {
+-    librbd::Image clone;
+-    ASSERT_PASSED(this->open_and_load, clone);
+-    ASSERT_EQ(0, clone.resize(this->m_data_size - 1));
+-    this->verify_size_and_overlap(clone, this->m_data_size - 1,
+-                                  this->m_data_size - 1);
+-    this->verify_data(clone, expected_bl);
+-    ASSERT_EQ(0, clone.flatten());
+-    this->verify_data(clone, expected_bl);
+-  }
+-
+-  {
+-    librbd::Image clone;
+-    ASSERT_PASSED(this->open_and_load_flattened, clone);
+-    this->verify_size_and_overlap(clone, this->m_data_size - 1, 0);
+-    this->verify_data(clone, expected_bl);
+-  }
+-}
+-
+-TYPED_TEST(EncryptedFlattenTest, ShrinkToOne)
+-{
+-  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
+-
+-  ASSERT_PASSED0(this->create_and_setup);
+-
+-  ceph::bufferlist expected_bl;
+-  expected_bl.append(std::string(1, 'a'));
+-
+-  {
+-    librbd::Image clone;
+-    ASSERT_PASSED(this->open_and_load, clone);
+-    ASSERT_EQ(0, clone.resize(1));
+-    this->verify_size_and_overlap(clone, 1, 1);
+-    this->verify_data(clone, expected_bl);
+-    ASSERT_EQ(0, clone.flatten());
+-    this->verify_data(clone, expected_bl);
+-  }
+-
+-  {
+-    librbd::Image clone;
+-    ASSERT_PASSED(this->open_and_load_flattened, clone);
+-    this->verify_size_and_overlap(clone, 1, 0);
+-    this->verify_data(clone, expected_bl);
+-  }
+-}
+-
+-TYPED_TEST(EncryptedFlattenTest, ShrinkToOneAfterSnapshot)
+-{
+-  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
+-
+-  ASSERT_PASSED0(this->create_and_setup);
+-
+-  ceph::bufferlist expected_bl;
+-  expected_bl.append(std::string(1, 'a'));
+-
+-  {
+-    librbd::Image clone;
+-    ASSERT_PASSED(this->open_and_load, clone);
+-    ASSERT_EQ(0, clone.snap_create("snap"));
+-    ASSERT_EQ(0, clone.resize(1));
+-    this->verify_size_and_overlap(clone, 1, 1);
+-    this->verify_data(clone, expected_bl);
+-    ASSERT_EQ(0, clone.flatten());
+-    this->verify_data(clone, expected_bl);
+-  }
+-
+-  {
+-    librbd::Image clone;
+-    ASSERT_PASSED(this->open_and_load_flattened, clone);
+-    this->verify_size_and_overlap(clone, 1, 0);
+-    this->verify_data(clone, expected_bl);
+-  }
+-}
+-
+-TYPED_TEST(EncryptedFlattenTest, MinOverlap)
+-{
+-  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
+-
+-  ASSERT_PASSED0(this->create_and_setup);
+-
+-  ceph::bufferlist expected_bl;
+-  expected_bl.append(std::string(1, 'a'));
+-  expected_bl.append_zero(this->m_data_size - 1);
+-
+-  {
+-    librbd::Image clone;
+-    ASSERT_PASSED(this->open_and_load, clone);
+-    ASSERT_EQ(0, clone.resize(1));
+-    ASSERT_EQ(0, clone.resize(this->m_data_size));
+-    this->verify_size_and_overlap(clone, this->m_data_size, 1);
+-    this->verify_data(clone, expected_bl);
+-    ASSERT_EQ(0, clone.flatten());
+-    this->verify_data(clone, expected_bl);
+-  }
+-
+-  {
+-    librbd::Image clone;
+-    ASSERT_PASSED(this->open_and_load_flattened, clone);
+-    this->verify_size_and_overlap(clone, this->m_data_size, 0);
+-    this->verify_data(clone, expected_bl);
+-  }
+-}
+-
+-TYPED_TEST(EncryptedFlattenTest, ZeroOverlap)
+-{
+-  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
+-
+-  ASSERT_PASSED0(this->create_and_setup);
+-
+-  ceph::bufferlist expected_bl;
+-  expected_bl.append_zero(this->m_data_size);
+-
+-  {
+-    librbd::Image clone;
+-    ASSERT_PASSED(this->open_and_load, clone);
+-    ASSERT_EQ(0, clone.resize(0));
+-    ASSERT_EQ(0, clone.resize(this->m_data_size));
+-    this->verify_size_and_overlap(clone, this->m_data_size, 0);
+-    this->verify_data(clone, expected_bl);
+-    ASSERT_EQ(0, clone.flatten());
+-    this->verify_data(clone, expected_bl);
+-  }
+-
+-  {
+-    librbd::Image clone;
+-    ASSERT_PASSED(this->open_and_load_flattened, clone);
+-    this->verify_size_and_overlap(clone, this->m_data_size, 0);
+-    this->verify_data(clone, expected_bl);
+-  }
+-}
+-
+-#endif // HAVE_LIBCRYPTSETUP
+-
+ TEST_F(TestLibRBD, TestIOWithIOHint)
+ {
+   rados_ioctx_t ioctx;
+diff --git a/src/test/librbd/test_main.cc b/src/test/librbd/test_main.cc
+index 85e9849658a2..f871a4e513b3 100644
+--- a/src/test/librbd/test_main.cc
++++ b/src/test/librbd/test_main.cc
+@@ -12,6 +12,7 @@
+ extern void register_test_librbd();
+ #ifdef TEST_LIBRBD_INTERNALS
+ extern void register_test_deep_copy();
++extern void register_test_encryption();
+ extern void register_test_groups();
+ extern void register_test_image_watcher();
+ extern void register_test_internal();
+@@ -33,6 +34,7 @@ int main(int argc, char **argv)
+   register_test_librbd();
+ #ifdef TEST_LIBRBD_INTERNALS
+   register_test_deep_copy();
++  register_test_encryption();
+   register_test_groups();
+   register_test_image_watcher();
+   register_test_internal();
+diff --git a/src/test/librbd/test_support.cc b/src/test/librbd/test_support.cc
+index bf343138ce58..a05280511636 100644
+--- a/src/test/librbd/test_support.cc
++++ b/src/test/librbd/test_support.cc
+@@ -54,7 +54,11 @@ int create_image_full_pp(librbd::RBD &rbd, librados::IoCtx &ioctx,
+ 
+ int create_image_pp(librbd::RBD &rbd, librados::IoCtx &ioctx,
+                     const std::string &name, uint64_t size) {
+-  int order = 0;
++  return create_image_pp(rbd, ioctx, name, size, 0);
++}
++
++int create_image_pp(librbd::RBD &rbd, librados::IoCtx &ioctx,
++                    const std::string &name, uint64_t size, int order) {
+   uint64_t features = 0;
+   if (!get_features(&features)) {
+     // ensure old-format tests actually use the old format
+diff --git a/src/test/librbd/test_support.h b/src/test/librbd/test_support.h
+index 4ab93c147c1d..288a2145fbe6 100644
+--- a/src/test/librbd/test_support.h
++++ b/src/test/librbd/test_support.h
+@@ -16,6 +16,8 @@ bool get_features(uint64_t *features);
+ bool is_feature_enabled(uint64_t feature);
+ int create_image_pp(librbd::RBD &rbd, librados::IoCtx &ioctx,
+                     const std::string &name, uint64_t size);
++int create_image_pp(librbd::RBD &rbd, librados::IoCtx &ioctx,
++                    const std::string &name, uint64_t size, int order);
+ int create_image_full_pp(librbd::RBD &rbd, librados::IoCtx &ioctx,
+                          const std::string &name, uint64_t size,
+                          uint64_t features, bool old_format, int *order);
+
+From 2f0ed3df82c0093dedd2838fd7e23026be8f8d0f Mon Sep 17 00:00:00 2001
+From: Ilya Dryomov <idryomov@gmail.com>
+Date: Sun, 21 Jun 2026 19:37:37 +0200
+Subject: [PATCH 3/3] test_DiffIterate.cc
+
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+---
+ src/test/librbd/CMakeLists.txt      |   1 +
+ src/test/librbd/test_DiffIterate.cc | 547 ++++++++++++++++++++++++++++
+ src/test/librbd/test_librbd.cc      | 504 -------------------------
+ src/test/librbd/test_main.cc        |   2 +
+ 4 files changed, 550 insertions(+), 504 deletions(-)
+ create mode 100644 src/test/librbd/test_DiffIterate.cc
+
+diff --git a/src/test/librbd/CMakeLists.txt b/src/test/librbd/CMakeLists.txt
+index f93d6d34a13c..9a01716fd4e9 100644
+--- a/src/test/librbd/CMakeLists.txt
++++ b/src/test/librbd/CMakeLists.txt
+@@ -12,6 +12,7 @@ set(librbd_test
+   test_internal.cc
+   test_mirroring.cc
+   test_DeepCopy.cc
++  test_DiffIterate.cc
+   test_Encryption.cc
+   test_Groups.cc
+   test_Migration.cc
+diff --git a/src/test/librbd/test_DiffIterate.cc b/src/test/librbd/test_DiffIterate.cc
+new file mode 100644
+index 000000000000..89864050cd2d
+--- /dev/null
++++ b/src/test/librbd/test_DiffIterate.cc
+@@ -0,0 +1,547 @@
++// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
++// vim: ts=8 sw=2 sts=2 expandtab
++
++#include "include/rbd/librbd.h"
++#include "include/rbd/librbd.hpp"
++#include "test/librbd/test_fixture.h"
++#include "test/librbd/test_support.h"
++#include "librbd/api/Image.h"
++
++void register_test_diff_iterate() {
++}
++
++struct diff_extent {
++  diff_extent(uint64_t _offset, uint64_t _length, bool _exists,
++              uint64_t object_size) :
++    offset(_offset), length(_length), exists(_exists)
++  {
++    if (object_size != 0) {
++      offset -= offset % object_size;
++      length = object_size;
++    }
++  }
++  uint64_t offset;
++  uint64_t length;
++  bool exists;
++  bool operator==(const diff_extent& o) const {
++    return offset == o.offset && length == o.length && exists == o.exists;
++  }
++};
++
++template <typename Policy>
++class DiffIterateDeterministicTest : public TestFixture {
++public:
++  static constexpr bool whole_object = Policy::whole_object;
++
++  static int format(librbd::ImageCtx* ictx, librbd::encryption_format_t format,
++                    librbd::encryption_options_t opts, size_t opts_size,
++                    bool c_api = false) {
++    // format with insecure_fast_mode=true to save time and CPU cycles
++    return librbd::api::Image<>::encryption_format(ictx, format, opts,
++                                                   opts_size, true, c_api);
++  }
++
++  static int vector_cb(uint64_t off, size_t len, int exists, void *arg) {
++    auto diff = static_cast<std::vector<diff_extent>*>(arg);
++    diff->push_back(diff_extent(off, len, exists, 0));
++    return 0;
++  }
++
++  static void validate_object_map(rbd_image_t image) {
++    uint64_t flags;
++    ASSERT_EQ(0, rbd_get_flags(image, &flags));
++    ASSERT_EQ(0, flags & RBD_FLAG_OBJECT_MAP_INVALID);
++  }
++
++  static void validate_object_map(librbd::Image& image) {
++    uint64_t flags;
++    ASSERT_EQ(0, image.get_flags(&flags));
++    ASSERT_EQ(0, flags & RBD_FLAG_OBJECT_MAP_INVALID);
++  }
++
++  void test_deterministic(uint64_t object_off, uint64_t len) {
++    std::string name = get_temp_image_name();
++    ASSERT_EQ(0, create_image_pp(m_rbd, m_ioctx, name, 20 << 20, 22));
++    librbd::ImageCtx* ictx;
++    ASSERT_EQ(0, open_image(name, &ictx));
++    test_deterministic(static_cast<rbd_image_t>(ictx), object_off, len, 1);
++    close_image(ictx);
++  }
++
++  void test_deterministic_pp(uint64_t object_off, uint64_t len) {
++    std::string name = get_temp_image_name();
++    ASSERT_EQ(0, create_image_pp(m_rbd, m_ioctx, name, 20 << 20, 22));
++    librbd::Image image;
++    ASSERT_EQ(0, m_rbd.open(m_ioctx, image, name.c_str(), NULL));
++    test_deterministic_pp(image, object_off, len, 1);
++  }
++
++#ifdef HAVE_LIBCRYPTSETUP
++
++  void test_deterministic_luks1(uint64_t object_off, uint64_t len) {
++    std::string name = get_temp_image_name();
++    ASSERT_EQ(0, create_image_pp(m_rbd, m_ioctx, name, 24 << 20, 22));
++    librbd::ImageCtx* ictx;
++    ASSERT_EQ(0, open_image(name, &ictx));
++    rbd_encryption_luks1_format_options_t fopts = {
++        RBD_ENCRYPTION_ALGORITHM_AES256, "some passphrase", 15};
++    ASSERT_EQ(0, format(ictx, RBD_ENCRYPTION_FORMAT_LUKS1, &fopts,
++                        sizeof(fopts), true));
++    test_deterministic(static_cast<rbd_image_t>(ictx), object_off, len, 512);
++    close_image(ictx);
++  }
++
++  void test_deterministic_luks1_pp(uint64_t object_off, uint64_t len) {
++    std::string name = get_temp_image_name();
++    ASSERT_EQ(0, create_image_pp(m_rbd, m_ioctx, name, 24 << 20, 22));
++    librbd::ImageCtx* ictx;
++    ASSERT_EQ(0, open_image(name, &ictx));
++    librbd::encryption_luks1_format_options_t fopts = {
++        RBD_ENCRYPTION_ALGORITHM_AES256, "some passphrase"};
++    ASSERT_EQ(0, format(ictx, RBD_ENCRYPTION_FORMAT_LUKS1, &fopts,
++                        sizeof(fopts)));
++    close_image(ictx);
++
++    librbd::Image image;
++    ASSERT_EQ(0, m_rbd.open(m_ioctx, image, name.c_str(), NULL));
++    ASSERT_EQ(0, image.encryption_load(RBD_ENCRYPTION_FORMAT_LUKS1, &fopts,
++                                       sizeof(fopts)));
++    test_deterministic_pp(image, object_off, len, 512);
++  }
++
++  void test_deterministic_luks2(uint64_t object_off, uint64_t len) {
++    std::string name = get_temp_image_name();
++    ASSERT_EQ(0, create_image_pp(m_rbd, m_ioctx, name, 36 << 20, 22));
++    librbd::ImageCtx* ictx;
++    ASSERT_EQ(0, open_image(name, &ictx));
++    rbd_encryption_luks2_format_options_t fopts = {
++        RBD_ENCRYPTION_ALGORITHM_AES256, "some passphrase", 15};
++    ASSERT_EQ(0, format(ictx, RBD_ENCRYPTION_FORMAT_LUKS2, &fopts,
++                        sizeof(fopts), true));
++    test_deterministic(static_cast<rbd_image_t>(ictx), object_off, len, 4096);
++    close_image(ictx);
++  }
++
++  void test_deterministic_luks2_pp(uint64_t object_off, uint64_t len) {
++    std::string name = get_temp_image_name();
++    ASSERT_EQ(0, create_image_pp(m_rbd, m_ioctx, name, 36 << 20, 22));
++    librbd::ImageCtx* ictx;
++    ASSERT_EQ(0, open_image(name, &ictx));
++    librbd::encryption_luks2_format_options_t fopts = {
++        RBD_ENCRYPTION_ALGORITHM_AES256, "some passphrase"};
++    ASSERT_EQ(0, format(ictx, RBD_ENCRYPTION_FORMAT_LUKS2, &fopts,
++                        sizeof(fopts)));
++    close_image(ictx);
++
++    librbd::Image image;
++    ASSERT_EQ(0, m_rbd.open(m_ioctx, image, name.c_str(), NULL));
++    ASSERT_EQ(0, image.encryption_load(RBD_ENCRYPTION_FORMAT_LUKS2, &fopts,
++                                       sizeof(fopts)));
++    test_deterministic_pp(image, object_off, len, 4096);
++  }
++
++#endif // HAVE_LIBCRYPTSETUP
++
++private:
++  void test_deterministic(rbd_image_t image, uint64_t object_off,
++                          uint64_t len, uint64_t block_size) {
++    uint64_t off1 = 0;
++    uint64_t off2 = 4 << 20;
++    uint64_t size = 20 << 20;
++    uint64_t extent_len = round_up_to(object_off + len, block_size);
++
++    rbd_image_info_t info;
++    ASSERT_EQ(0, rbd_stat(image, &info, sizeof(info)));
++    ASSERT_EQ(size, info.size);
++    ASSERT_EQ(5, info.num_objs);
++    ASSERT_EQ(4 << 20, info.obj_size);
++    ASSERT_EQ(22, info.order);
++
++    uint64_t object_size = 0;
++    if (whole_object) {
++      object_size = 1 << info.order;
++    }
++
++    std::vector<diff_extent> extents;
++    ASSERT_EQ(0, rbd_diff_iterate2(image, NULL, 0, size, true, whole_object,
++                                   vector_cb, &extents));
++    ASSERT_EQ(0u, extents.size());
++
++    ASSERT_EQ(-ENOENT, rbd_diff_iterate2(image, "snap1", 0, size, true,
++                                         whole_object, vector_cb, &extents));
++
++    ASSERT_EQ(0, rbd_snap_create(image, "snap1"));
++
++    std::string buf(len, '1');
++    ASSERT_EQ(len, rbd_write(image, off1 + object_off, len, buf.data()));
++    ASSERT_EQ(0, rbd_diff_iterate2(image, NULL, 0, size, true, whole_object,
++                                   vector_cb, &extents));
++    ASSERT_EQ(1u, extents.size());
++    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
++    extents.clear();
++
++    ASSERT_EQ(0, rbd_snap_create(image, "snap2"));
++
++    ASSERT_EQ(len, rbd_write(image, off2 + object_off, len, buf.data()));
++    ASSERT_EQ(0, rbd_diff_iterate2(image, NULL, 0, size, true, whole_object,
++                                   vector_cb, &extents));
++    ASSERT_EQ(2u, extents.size());
++    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
++    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[1]);
++    extents.clear();
++
++    ASSERT_EQ(0, rbd_snap_create(image, "snap3"));
++
++    // 1. beginning of time -> HEAD
++    ASSERT_EQ(0, rbd_diff_iterate2(image, NULL, 0, size, true, whole_object,
++                                   vector_cb, &extents));
++    ASSERT_EQ(2u, extents.size());
++    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
++    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[1]);
++    extents.clear();
++
++    // 2. snap1 -> HEAD
++    ASSERT_EQ(0, rbd_diff_iterate2(image, "snap1", 0, size, true, whole_object,
++                                   vector_cb, &extents));
++    ASSERT_EQ(2u, extents.size());
++    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
++    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[1]);
++    extents.clear();
++
++    // 3. snap2 -> HEAD
++    ASSERT_EQ(0, rbd_diff_iterate2(image, "snap2", 0, size, true, whole_object,
++                                   vector_cb, &extents));
++    ASSERT_EQ(1u, extents.size());
++    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[0]);
++    extents.clear();
++
++    // 4. snap3 -> HEAD
++    ASSERT_EQ(0, rbd_diff_iterate2(image, "snap3", 0, size, true, whole_object,
++                                   vector_cb, &extents));
++    ASSERT_EQ(0u, extents.size());
++
++    ASSERT_NO_FATAL_FAILURE(validate_object_map(image));
++    ASSERT_EQ(0, rbd_snap_set(image, "snap3"));
++
++    // 5. beginning of time -> snap3
++    ASSERT_EQ(0, rbd_diff_iterate2(image, NULL, 0, size, true, whole_object,
++                                   vector_cb, &extents));
++    ASSERT_EQ(2u, extents.size());
++    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
++    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[1]);
++    extents.clear();
++
++    // 6. snap1 -> snap3
++    ASSERT_EQ(0, rbd_diff_iterate2(image, "snap1", 0, size, true, whole_object,
++                                   vector_cb, &extents));
++    ASSERT_EQ(2u, extents.size());
++    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
++    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[1]);
++    extents.clear();
++
++    // 7. snap2 -> snap3
++    ASSERT_EQ(0, rbd_diff_iterate2(image, "snap2", 0, size, true, whole_object,
++                                   vector_cb, &extents));
++    ASSERT_EQ(1u, extents.size());
++    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[0]);
++    extents.clear();
++
++    // 8. snap3 -> snap3
++    ASSERT_EQ(0, rbd_diff_iterate2(image, "snap3", 0, size, true, whole_object,
++                                   vector_cb, &extents));
++    ASSERT_EQ(0u, extents.size());
++
++    ASSERT_NO_FATAL_FAILURE(validate_object_map(image));
++    ASSERT_EQ(0, rbd_snap_set(image, "snap2"));
++
++    // 9. beginning of time -> snap2
++    ASSERT_EQ(0, rbd_diff_iterate2(image, NULL, 0, size, true, whole_object,
++                                   vector_cb, &extents));
++    ASSERT_EQ(1u, extents.size());
++    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
++    extents.clear();
++
++    // 10. snap1 -> snap2
++    ASSERT_EQ(0, rbd_diff_iterate2(image, "snap1", 0, size, true, whole_object,
++                                   vector_cb, &extents));
++    ASSERT_EQ(1u, extents.size());
++    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
++    extents.clear();
++
++    // 11. snap2 -> snap2
++    ASSERT_EQ(0, rbd_diff_iterate2(image, "snap2", 0, size, true, whole_object,
++                                   vector_cb, &extents));
++    ASSERT_EQ(0u, extents.size());
++
++    // 12. snap3 -> snap2
++    ASSERT_EQ(-EINVAL, rbd_diff_iterate2(image, "snap3", 0, size, true,
++                                         whole_object, vector_cb, &extents));
++
++    ASSERT_NO_FATAL_FAILURE(validate_object_map(image));
++    ASSERT_EQ(0, rbd_snap_set(image, "snap1"));
++
++    // 13. beginning of time -> snap1
++    ASSERT_EQ(0, rbd_diff_iterate2(image, NULL, 0, size, true, whole_object,
++                                   vector_cb, &extents));
++    ASSERT_EQ(0u, extents.size());
++
++    // 14. snap1 -> snap1
++    ASSERT_EQ(0, rbd_diff_iterate2(image, "snap1", 0, size, true, whole_object,
++                                   vector_cb, &extents));
++    ASSERT_EQ(0u, extents.size());
++
++    // 15. snap2 -> snap1
++    ASSERT_EQ(-EINVAL, rbd_diff_iterate2(image, "snap2", 0, size, true,
++                                         whole_object, vector_cb, &extents));
++
++    // 16. snap3 -> snap1
++    ASSERT_EQ(-EINVAL, rbd_diff_iterate2(image, "snap3", 0, size, true,
++                                         whole_object, vector_cb, &extents));
++
++    ASSERT_NO_FATAL_FAILURE(validate_object_map(image));
++  }
++
++  void test_deterministic_pp(librbd::Image& image, uint64_t object_off,
++                             uint64_t len, uint64_t block_size) {
++    uint64_t off1 = 8 << 20;
++    uint64_t off2 = 16 << 20;
++    uint64_t size = 20 << 20;
++    uint64_t extent_len = round_up_to(object_off + len, block_size);
++
++    librbd::image_info_t info;
++    ASSERT_EQ(0, image.stat(info, sizeof(info)));
++    ASSERT_EQ(size, info.size);
++    ASSERT_EQ(5, info.num_objs);
++    ASSERT_EQ(4 << 20, info.obj_size);
++    ASSERT_EQ(22, info.order);
++
++    uint64_t object_size = 0;
++    if (whole_object) {
++      object_size = 1 << info.order;
++    }
++
++    std::vector<diff_extent> extents;
++    ASSERT_EQ(0, image.diff_iterate2(NULL, 0, size, true, whole_object,
++                                     vector_cb, &extents));
++    ASSERT_EQ(0u, extents.size());
++
++    ASSERT_EQ(-ENOENT, image.diff_iterate2("snap1", 0, size, true,
++                                           whole_object, vector_cb, &extents));
++
++    ASSERT_EQ(0, image.snap_create("snap1"));
++
++    ceph::bufferlist bl;
++    bl.append(std::string(len, '1'));
++    ASSERT_EQ(len, image.write(off1 + object_off, len, bl));
++    ASSERT_EQ(0, image.diff_iterate2(NULL, 0, size, true, whole_object,
++                                     vector_cb, &extents));
++    ASSERT_EQ(1u, extents.size());
++    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
++    extents.clear();
++
++    ASSERT_EQ(0, image.snap_create("snap2"));
++
++    ASSERT_EQ(len, image.write(off2 + object_off, len, bl));
++    ASSERT_EQ(0, image.diff_iterate2(NULL, 0, size, true, whole_object,
++                                     vector_cb, &extents));
++    ASSERT_EQ(2u, extents.size());
++    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
++    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[1]);
++    extents.clear();
++
++    ASSERT_EQ(0, image.snap_create("snap3"));
++
++    // 1. beginning of time -> HEAD
++    ASSERT_EQ(0, image.diff_iterate2(NULL, 0, size, true, whole_object,
++                                     vector_cb, &extents));
++    ASSERT_EQ(2u, extents.size());
++    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
++    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[1]);
++    extents.clear();
++
++    // 2. snap1 -> HEAD
++    ASSERT_EQ(0, image.diff_iterate2("snap1", 0, size, true, whole_object,
++                                     vector_cb, &extents));
++    ASSERT_EQ(2u, extents.size());
++    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
++    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[1]);
++    extents.clear();
++
++    // 3. snap2 -> HEAD
++    ASSERT_EQ(0, image.diff_iterate2("snap2", 0, size, true, whole_object,
++                                     vector_cb, &extents));
++    ASSERT_EQ(1u, extents.size());
++    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[0]);
++    extents.clear();
++
++    // 4. snap3 -> HEAD
++    ASSERT_EQ(0, image.diff_iterate2("snap3", 0, size, true, whole_object,
++                                     vector_cb, &extents));
++    ASSERT_EQ(0u, extents.size());
++
++    ASSERT_NO_FATAL_FAILURE(validate_object_map(image));
++    ASSERT_EQ(0, image.snap_set("snap3"));
++
++    // 5. beginning of time -> snap3
++    ASSERT_EQ(0, image.diff_iterate2(NULL, 0, size, true, whole_object,
++                                     vector_cb, &extents));
++    ASSERT_EQ(2u, extents.size());
++    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
++    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[1]);
++    extents.clear();
++
++    // 6. snap1 -> snap3
++    ASSERT_EQ(0, image.diff_iterate2("snap1", 0, size, true, whole_object,
++                                     vector_cb, &extents));
++    ASSERT_EQ(2u, extents.size());
++    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
++    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[1]);
++    extents.clear();
++
++    // 7. snap2 -> snap3
++    ASSERT_EQ(0, image.diff_iterate2("snap2", 0, size, true, whole_object,
++                                     vector_cb, &extents));
++    ASSERT_EQ(1u, extents.size());
++    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[0]);
++    extents.clear();
++
++    // 8. snap3 -> snap3
++    ASSERT_EQ(0, image.diff_iterate2("snap3", 0, size, true, whole_object,
++                                     vector_cb, &extents));
++    ASSERT_EQ(0u, extents.size());
++
++    ASSERT_NO_FATAL_FAILURE(validate_object_map(image));
++    ASSERT_EQ(0, image.snap_set("snap2"));
++
++    // 9. beginning of time -> snap2
++    ASSERT_EQ(0, image.diff_iterate2(NULL, 0, size, true, whole_object,
++                                     vector_cb, &extents));
++    ASSERT_EQ(1u, extents.size());
++    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
++    extents.clear();
++
++    // 10. snap1 -> snap2
++    ASSERT_EQ(0, image.diff_iterate2("snap1", 0, size, true, whole_object,
++                                     vector_cb, &extents));
++    ASSERT_EQ(1u, extents.size());
++    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
++    extents.clear();
++
++    // 11. snap2 -> snap2
++    ASSERT_EQ(0, image.diff_iterate2("snap2", 0, size, true, whole_object,
++                                     vector_cb, &extents));
++    ASSERT_EQ(0u, extents.size());
++
++    // 12. snap3 -> snap2
++    ASSERT_EQ(-EINVAL, image.diff_iterate2("snap3", 0, size, true,
++                                           whole_object, vector_cb, &extents));
++
++    ASSERT_NO_FATAL_FAILURE(validate_object_map(image));
++    ASSERT_EQ(0, image.snap_set("snap1"));
++
++    // 13. beginning of time -> snap1
++    ASSERT_EQ(0, image.diff_iterate2(NULL, 0, size, true, whole_object,
++                                     vector_cb, &extents));
++    ASSERT_EQ(0u, extents.size());
++
++    // 14. snap1 -> snap1
++    ASSERT_EQ(0, image.diff_iterate2("snap1", 0, size, true, whole_object,
++                                     vector_cb, &extents));
++    ASSERT_EQ(0u, extents.size());
++
++    // 15. snap2 -> snap1
++    ASSERT_EQ(-EINVAL, image.diff_iterate2("snap2", 0, size, true,
++                                           whole_object, vector_cb, &extents));
++
++    // 16. snap3 -> snap1
++    ASSERT_EQ(-EINVAL, image.diff_iterate2("snap3", 0, size, true,
++                                           whole_object, vector_cb, &extents));
++
++    ASSERT_NO_FATAL_FAILURE(validate_object_map(image));
++  }
++};
++
++struct Exact {
++  static constexpr bool whole_object = false;
++};
++
++struct WholeObject {
++  static constexpr bool whole_object = true;
++};
++
++using DiffIterateDeterministicTestTypes = ::testing::Types<Exact, WholeObject>;
++TYPED_TEST_SUITE(DiffIterateDeterministicTest, DiffIterateDeterministicTestTypes);
++
++TYPED_TEST(DiffIterateDeterministicTest, Basic)
++{
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
++
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic(0, 256));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic((1 << 20) - 256, 256));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic((1 << 20) - 128, 256));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic(1 << 20, 256));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic((4 << 20) - 256, 256));
++}
++
++TYPED_TEST(DiffIterateDeterministicTest, BasicPP)
++{
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
++
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_pp(0, 2));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_pp((3 << 20) - 2, 2));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_pp((3 << 20) - 1, 2));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_pp(3 << 20, 2));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_pp((4 << 20) - 2, 2));
++}
++
++#ifdef HAVE_LIBCRYPTSETUP
++
++TYPED_TEST(DiffIterateDeterministicTest, LUKS1)
++{
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
++
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks1(0, 256));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks1((1 << 20) - 256, 256));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks1((1 << 20) - 128, 256));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks1(1 << 20, 256));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks1((4 << 20) - 256, 256));
++}
++
++TYPED_TEST(DiffIterateDeterministicTest, LUKS1PP)
++{
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
++
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks1_pp(0, 2));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks1_pp((3 << 20) - 2, 2));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks1_pp((3 << 20) - 1, 2));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks1_pp(3 << 20, 2));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks1_pp((4 << 20) - 2, 2));
++}
++
++TYPED_TEST(DiffIterateDeterministicTest, LUKS2)
++{
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
++
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks2(0, 256));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks2((1 << 20) - 256, 256));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks2((1 << 20) - 128, 256));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks2(1 << 20, 256));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks2((4 << 20) - 256, 256));
++}
++
++TYPED_TEST(DiffIterateDeterministicTest, LUKS2PP)
++{
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
++  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
++
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks2_pp(0, 2));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks2_pp((3 << 20) - 2, 2));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks2_pp((3 << 20) - 1, 2));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks2_pp(3 << 20, 2));
++  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks2_pp((4 << 20) - 2, 2));
++}
++
++#endif // HAVE_LIBCRYPTSETUP
+diff --git a/src/test/librbd/test_librbd.cc b/src/test/librbd/test_librbd.cc
+index 95d0373ee56f..0fa7899f3f2f 100644
+--- a/src/test/librbd/test_librbd.cc
++++ b/src/test/librbd/test_librbd.cc
+@@ -5933,436 +5933,6 @@ template <typename T>
+ class DiffIterateTest : public TestLibRBD {
+ public:
+   static const uint8_t whole_object = T::whole_object;
+-
+-  void test_deterministic(uint64_t object_off, uint64_t len) {
+-    rados_ioctx_t ioctx;
+-    ASSERT_EQ(0, rados_ioctx_create(_cluster, m_pool_name.c_str(), &ioctx));
+-
+-    rbd_image_t image;
+-    int order = 22;
+-    std::string name = this->get_temp_image_name();
+-    ASSERT_EQ(0, create_image(ioctx, name.c_str(), 20 << 20, &order));
+-    ASSERT_EQ(0, rbd_open(ioctx, name.c_str(), &image, NULL));
+-    test_deterministic(image, object_off, len, 1);
+-
+-    ASSERT_EQ(0, rbd_close(image));
+-    rados_ioctx_destroy(ioctx);
+-  }
+-
+-  void test_deterministic_pp(uint64_t object_off, uint64_t len) {
+-    librados::IoCtx ioctx;
+-    ASSERT_EQ(0, _rados.ioctx_create(m_pool_name.c_str(), ioctx));
+-
+-    librbd::RBD rbd;
+-    librbd::Image image;
+-    int order = 22;
+-    std::string name = this->get_temp_image_name();
+-    ASSERT_EQ(0, create_image_pp(rbd, ioctx, name.c_str(), 20 << 20, &order));
+-    ASSERT_EQ(0, rbd.open(ioctx, image, name.c_str(), NULL));
+-    test_deterministic_pp(image, object_off, len, 1);
+-  }
+-
+-#ifdef HAVE_LIBCRYPTSETUP
+-
+-  void test_deterministic_luks1(uint64_t object_off, uint64_t len) {
+-    rados_ioctx_t ioctx;
+-    ASSERT_EQ(0, rados_ioctx_create(_cluster, m_pool_name.c_str(), &ioctx));
+-
+-    rbd_image_t image;
+-    int order = 22;
+-    std::string name = this->get_temp_image_name();
+-    ASSERT_EQ(0, create_image(ioctx, name.c_str(), 24 << 20, &order));
+-    ASSERT_EQ(0, rbd_open(ioctx, name.c_str(), &image, NULL));
+-    rbd_encryption_luks1_format_options_t fopts = {
+-        RBD_ENCRYPTION_ALGORITHM_AES256, "some passphrase", 15};
+-    ASSERT_EQ(0, rbd_encryption_format(image, RBD_ENCRYPTION_FORMAT_LUKS1,
+-                                       &fopts, sizeof(fopts)));
+-    test_deterministic(image, object_off, len, 512);
+-
+-    ASSERT_EQ(0, rbd_close(image));
+-    rados_ioctx_destroy(ioctx);
+-  }
+-
+-  void test_deterministic_luks1_pp(uint64_t object_off, uint64_t len) {
+-    librados::IoCtx ioctx;
+-    ASSERT_EQ(0, _rados.ioctx_create(m_pool_name.c_str(), ioctx));
+-
+-    librbd::RBD rbd;
+-    librbd::Image image;
+-    int order = 22;
+-    std::string name = this->get_temp_image_name();
+-    ASSERT_EQ(0, create_image_pp(rbd, ioctx, name.c_str(), 24 << 20, &order));
+-    ASSERT_EQ(0, rbd.open(ioctx, image, name.c_str(), NULL));
+-    librbd::encryption_luks1_format_options_t fopts = {
+-        RBD_ENCRYPTION_ALGORITHM_AES256, "some passphrase"};
+-    ASSERT_EQ(0, image.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS1, &fopts,
+-                                         sizeof(fopts)));
+-    test_deterministic_pp(image, object_off, len, 512);
+-  }
+-
+-  void test_deterministic_luks2(uint64_t object_off, uint64_t len) {
+-    rados_ioctx_t ioctx;
+-    ASSERT_EQ(0, rados_ioctx_create(_cluster, m_pool_name.c_str(), &ioctx));
+-
+-    rbd_image_t image;
+-    int order = 22;
+-    std::string name = this->get_temp_image_name();
+-    ASSERT_EQ(0, create_image(ioctx, name.c_str(), 36 << 20, &order));
+-    ASSERT_EQ(0, rbd_open(ioctx, name.c_str(), &image, NULL));
+-    rbd_encryption_luks2_format_options_t fopts = {
+-        RBD_ENCRYPTION_ALGORITHM_AES256, "some passphrase", 15};
+-    ASSERT_EQ(0, rbd_encryption_format(image, RBD_ENCRYPTION_FORMAT_LUKS2,
+-                                       &fopts, sizeof(fopts)));
+-    test_deterministic(image, object_off, len, 4096);
+-
+-    ASSERT_EQ(0, rbd_close(image));
+-    rados_ioctx_destroy(ioctx);
+-  }
+-
+-  void test_deterministic_luks2_pp(uint64_t object_off, uint64_t len) {
+-    librados::IoCtx ioctx;
+-    ASSERT_EQ(0, _rados.ioctx_create(m_pool_name.c_str(), ioctx));
+-
+-    librbd::RBD rbd;
+-    librbd::Image image;
+-    int order = 22;
+-    std::string name = this->get_temp_image_name();
+-    ASSERT_EQ(0, create_image_pp(rbd, ioctx, name.c_str(), 36 << 20, &order));
+-    ASSERT_EQ(0, rbd.open(ioctx, image, name.c_str(), NULL));
+-    librbd::encryption_luks2_format_options_t fopts = {
+-        RBD_ENCRYPTION_ALGORITHM_AES256, "some passphrase"};
+-    ASSERT_EQ(0, image.encryption_format(RBD_ENCRYPTION_FORMAT_LUKS2, &fopts,
+-                                         sizeof(fopts)));
+-    test_deterministic_pp(image, object_off, len, 4096);
+-  }
+-
+-#endif // HAVE_LIBCRYPTSETUP
+-
+-private:
+-  void test_deterministic(rbd_image_t image, uint64_t object_off,
+-                          uint64_t len, uint64_t block_size) {
+-    uint64_t off1 = 0;
+-    uint64_t off2 = 4 << 20;
+-    uint64_t size = 20 << 20;
+-    uint64_t extent_len = round_up_to(object_off + len, block_size);
+-
+-    rbd_image_info_t info;
+-    ASSERT_EQ(0, rbd_stat(image, &info, sizeof(info)));
+-    ASSERT_EQ(size, info.size);
+-    ASSERT_EQ(5, info.num_objs);
+-    ASSERT_EQ(4 << 20, info.obj_size);
+-    ASSERT_EQ(22, info.order);
+-
+-    uint64_t object_size = 0;
+-    if (whole_object) {
+-      object_size = 1 << info.order;
+-    }
+-
+-    std::vector<diff_extent> extents;
+-    ASSERT_EQ(0, rbd_diff_iterate2(image, NULL, 0, size, true, whole_object,
+-                                   vector_iterate_cb, &extents));
+-    ASSERT_EQ(0u, extents.size());
+-
+-    ASSERT_EQ(-ENOENT, rbd_diff_iterate2(image, "snap1", 0, size, true,
+-                                         whole_object, vector_iterate_cb,
+-                                         &extents));
+-
+-    ASSERT_EQ(0, rbd_snap_create(image, "snap1"));
+-
+-    std::string buf(len, '1');
+-    ASSERT_EQ(len, rbd_write(image, off1 + object_off, len, buf.data()));
+-    ASSERT_EQ(0, rbd_diff_iterate2(image, NULL, 0, size, true, whole_object,
+-                                   vector_iterate_cb, &extents));
+-    ASSERT_EQ(1u, extents.size());
+-    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
+-    extents.clear();
+-
+-    ASSERT_EQ(0, rbd_snap_create(image, "snap2"));
+-
+-    ASSERT_EQ(len, rbd_write(image, off2 + object_off, len, buf.data()));
+-    ASSERT_EQ(0, rbd_diff_iterate2(image, NULL, 0, size, true, whole_object,
+-                                   vector_iterate_cb, &extents));
+-    ASSERT_EQ(2u, extents.size());
+-    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
+-    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[1]);
+-    extents.clear();
+-
+-    ASSERT_EQ(0, rbd_snap_create(image, "snap3"));
+-
+-    // 1. beginning of time -> HEAD
+-    ASSERT_EQ(0, rbd_diff_iterate2(image, NULL, 0, size, true, whole_object,
+-                                   vector_iterate_cb, &extents));
+-    ASSERT_EQ(2u, extents.size());
+-    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
+-    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[1]);
+-    extents.clear();
+-
+-    // 2. snap1 -> HEAD
+-    ASSERT_EQ(0, rbd_diff_iterate2(image, "snap1", 0, size, true, whole_object,
+-                                   vector_iterate_cb, &extents));
+-    ASSERT_EQ(2u, extents.size());
+-    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
+-    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[1]);
+-    extents.clear();
+-
+-    // 3. snap2 -> HEAD
+-    ASSERT_EQ(0, rbd_diff_iterate2(image, "snap2", 0, size, true, whole_object,
+-                                   vector_iterate_cb, &extents));
+-    ASSERT_EQ(1u, extents.size());
+-    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[0]);
+-    extents.clear();
+-
+-    // 4. snap3 -> HEAD
+-    ASSERT_EQ(0, rbd_diff_iterate2(image, "snap3", 0, size, true, whole_object,
+-                                   vector_iterate_cb, &extents));
+-    ASSERT_EQ(0u, extents.size());
+-
+-    ASSERT_PASSED(validate_object_map, image);
+-    ASSERT_EQ(0, rbd_snap_set(image, "snap3"));
+-
+-    // 5. beginning of time -> snap3
+-    ASSERT_EQ(0, rbd_diff_iterate2(image, NULL, 0, size, true, whole_object,
+-                                   vector_iterate_cb, &extents));
+-    ASSERT_EQ(2u, extents.size());
+-    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
+-    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[1]);
+-    extents.clear();
+-
+-    // 6. snap1 -> snap3
+-    ASSERT_EQ(0, rbd_diff_iterate2(image, "snap1", 0, size, true, whole_object,
+-                                   vector_iterate_cb, &extents));
+-    ASSERT_EQ(2u, extents.size());
+-    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
+-    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[1]);
+-    extents.clear();
+-
+-    // 7. snap2 -> snap3
+-    ASSERT_EQ(0, rbd_diff_iterate2(image, "snap2", 0, size, true, whole_object,
+-                                   vector_iterate_cb, &extents));
+-    ASSERT_EQ(1u, extents.size());
+-    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[0]);
+-    extents.clear();
+-
+-    // 8. snap3 -> snap3
+-    ASSERT_EQ(0, rbd_diff_iterate2(image, "snap3", 0, size, true, whole_object,
+-                                   vector_iterate_cb, &extents));
+-    ASSERT_EQ(0u, extents.size());
+-
+-    ASSERT_PASSED(validate_object_map, image);
+-    ASSERT_EQ(0, rbd_snap_set(image, "snap2"));
+-
+-    // 9. beginning of time -> snap2
+-    ASSERT_EQ(0, rbd_diff_iterate2(image, NULL, 0, size, true, whole_object,
+-                                   vector_iterate_cb, &extents));
+-    ASSERT_EQ(1u, extents.size());
+-    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
+-    extents.clear();
+-
+-    // 10. snap1 -> snap2
+-    ASSERT_EQ(0, rbd_diff_iterate2(image, "snap1", 0, size, true, whole_object,
+-                                   vector_iterate_cb, &extents));
+-    ASSERT_EQ(1u, extents.size());
+-    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
+-    extents.clear();
+-
+-    // 11. snap2 -> snap2
+-    ASSERT_EQ(0, rbd_diff_iterate2(image, "snap2", 0, size, true, whole_object,
+-                                   vector_iterate_cb, &extents));
+-    ASSERT_EQ(0u, extents.size());
+-
+-    // 12. snap3 -> snap2
+-    ASSERT_EQ(-EINVAL, rbd_diff_iterate2(image, "snap3", 0, size, true,
+-                                         whole_object, vector_iterate_cb,
+-                                         &extents));
+-
+-    ASSERT_PASSED(validate_object_map, image);
+-    ASSERT_EQ(0, rbd_snap_set(image, "snap1"));
+-
+-    // 13. beginning of time -> snap1
+-    ASSERT_EQ(0, rbd_diff_iterate2(image, NULL, 0, size, true, whole_object,
+-                                   vector_iterate_cb, &extents));
+-    ASSERT_EQ(0u, extents.size());
+-
+-    // 14. snap1 -> snap1
+-    ASSERT_EQ(0, rbd_diff_iterate2(image, "snap1", 0, size, true, whole_object,
+-                                   vector_iterate_cb, &extents));
+-    ASSERT_EQ(0u, extents.size());
+-
+-    // 15. snap2 -> snap1
+-    ASSERT_EQ(-EINVAL, rbd_diff_iterate2(image, "snap2", 0, size, true,
+-                                         whole_object, vector_iterate_cb,
+-                                         &extents));
+-
+-    // 16. snap3 -> snap1
+-    ASSERT_EQ(-EINVAL, rbd_diff_iterate2(image, "snap3", 0, size, true,
+-                                         whole_object, vector_iterate_cb,
+-                                         &extents));
+-
+-    ASSERT_PASSED(validate_object_map, image);
+-  }
+-
+-  void test_deterministic_pp(librbd::Image& image, uint64_t object_off,
+-                             uint64_t len, uint64_t block_size) {
+-    uint64_t off1 = 8 << 20;
+-    uint64_t off2 = 16 << 20;
+-    uint64_t size = 20 << 20;
+-    uint64_t extent_len = round_up_to(object_off + len, block_size);
+-
+-    librbd::image_info_t info;
+-    ASSERT_EQ(0, image.stat(info, sizeof(info)));
+-    ASSERT_EQ(size, info.size);
+-    ASSERT_EQ(5, info.num_objs);
+-    ASSERT_EQ(4 << 20, info.obj_size);
+-    ASSERT_EQ(22, info.order);
+-
+-    uint64_t object_size = 0;
+-    if (whole_object) {
+-      object_size = 1 << info.order;
+-    }
+-
+-    std::vector<diff_extent> extents;
+-    ASSERT_EQ(0, image.diff_iterate2(NULL, 0, size, true, whole_object,
+-                                     vector_iterate_cb, &extents));
+-    ASSERT_EQ(0u, extents.size());
+-
+-    ASSERT_EQ(-ENOENT, image.diff_iterate2("snap1", 0, size, true,
+-                                           whole_object, vector_iterate_cb,
+-                                           &extents));
+-
+-    ASSERT_EQ(0, image.snap_create("snap1"));
+-
+-    ceph::bufferlist bl;
+-    bl.append(std::string(len, '1'));
+-    ASSERT_EQ(len, image.write(off1 + object_off, len, bl));
+-    ASSERT_EQ(0, image.diff_iterate2(NULL, 0, size, true, whole_object,
+-                                     vector_iterate_cb, &extents));
+-    ASSERT_EQ(1u, extents.size());
+-    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
+-    extents.clear();
+-
+-    ASSERT_EQ(0, image.snap_create("snap2"));
+-
+-    ASSERT_EQ(len, image.write(off2 + object_off, len, bl));
+-    ASSERT_EQ(0, image.diff_iterate2(NULL, 0, size, true, whole_object,
+-                                     vector_iterate_cb, &extents));
+-    ASSERT_EQ(2u, extents.size());
+-    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
+-    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[1]);
+-    extents.clear();
+-
+-    ASSERT_EQ(0, image.snap_create("snap3"));
+-
+-    // 1. beginning of time -> HEAD
+-    ASSERT_EQ(0, image.diff_iterate2(NULL, 0, size, true, whole_object,
+-                                     vector_iterate_cb, &extents));
+-    ASSERT_EQ(2u, extents.size());
+-    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
+-    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[1]);
+-    extents.clear();
+-
+-    // 2. snap1 -> HEAD
+-    ASSERT_EQ(0, image.diff_iterate2("snap1", 0, size, true, whole_object,
+-                                     vector_iterate_cb, &extents));
+-    ASSERT_EQ(2u, extents.size());
+-    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
+-    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[1]);
+-    extents.clear();
+-
+-    // 3. snap2 -> HEAD
+-    ASSERT_EQ(0, image.diff_iterate2("snap2", 0, size, true, whole_object,
+-                                     vector_iterate_cb, &extents));
+-    ASSERT_EQ(1u, extents.size());
+-    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[0]);
+-    extents.clear();
+-
+-    // 4. snap3 -> HEAD
+-    ASSERT_EQ(0, image.diff_iterate2("snap3", 0, size, true, whole_object,
+-                                     vector_iterate_cb, &extents));
+-    ASSERT_EQ(0u, extents.size());
+-
+-    ASSERT_PASSED(validate_object_map, image);
+-    ASSERT_EQ(0, image.snap_set("snap3"));
+-
+-    // 5. beginning of time -> snap3
+-    ASSERT_EQ(0, image.diff_iterate2(NULL, 0, size, true, whole_object,
+-                                     vector_iterate_cb, &extents));
+-    ASSERT_EQ(2u, extents.size());
+-    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
+-    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[1]);
+-    extents.clear();
+-
+-    // 6. snap1 -> snap3
+-    ASSERT_EQ(0, image.diff_iterate2("snap1", 0, size, true, whole_object,
+-                                     vector_iterate_cb, &extents));
+-    ASSERT_EQ(2u, extents.size());
+-    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
+-    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[1]);
+-    extents.clear();
+-
+-    // 7. snap2 -> snap3
+-    ASSERT_EQ(0, image.diff_iterate2("snap2", 0, size, true, whole_object,
+-                                     vector_iterate_cb, &extents));
+-    ASSERT_EQ(1u, extents.size());
+-    ASSERT_EQ(diff_extent(off2, extent_len, true, object_size), extents[0]);
+-    extents.clear();
+-
+-    // 8. snap3 -> snap3
+-    ASSERT_EQ(0, image.diff_iterate2("snap3", 0, size, true, whole_object,
+-                                     vector_iterate_cb, &extents));
+-    ASSERT_EQ(0u, extents.size());
+-
+-    ASSERT_PASSED(validate_object_map, image);
+-    ASSERT_EQ(0, image.snap_set("snap2"));
+-
+-    // 9. beginning of time -> snap2
+-    ASSERT_EQ(0, image.diff_iterate2(NULL, 0, size, true, whole_object,
+-                                     vector_iterate_cb, &extents));
+-    ASSERT_EQ(1u, extents.size());
+-    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
+-    extents.clear();
+-
+-    // 10. snap1 -> snap2
+-    ASSERT_EQ(0, image.diff_iterate2("snap1", 0, size, true, whole_object,
+-                                     vector_iterate_cb, &extents));
+-    ASSERT_EQ(1u, extents.size());
+-    ASSERT_EQ(diff_extent(off1, extent_len, true, object_size), extents[0]);
+-    extents.clear();
+-
+-    // 11. snap2 -> snap2
+-    ASSERT_EQ(0, image.diff_iterate2("snap2", 0, size, true, whole_object,
+-                                     vector_iterate_cb, &extents));
+-    ASSERT_EQ(0u, extents.size());
+-
+-    // 12. snap3 -> snap2
+-    ASSERT_EQ(-EINVAL, image.diff_iterate2("snap3", 0, size, true,
+-                                           whole_object, vector_iterate_cb,
+-                                           &extents));
+-
+-    ASSERT_PASSED(validate_object_map, image);
+-    ASSERT_EQ(0, image.snap_set("snap1"));
+-
+-    // 13. beginning of time -> snap1
+-    ASSERT_EQ(0, image.diff_iterate2(NULL, 0, size, true, whole_object,
+-                                     vector_iterate_cb, &extents));
+-    ASSERT_EQ(0u, extents.size());
+-
+-    // 14. snap1 -> snap1
+-    ASSERT_EQ(0, image.diff_iterate2("snap1", 0, size, true, whole_object,
+-                                     vector_iterate_cb, &extents));
+-    ASSERT_EQ(0u, extents.size());
+-
+-    // 15. snap2 -> snap1
+-    ASSERT_EQ(-EINVAL, image.diff_iterate2("snap2", 0, size, true,
+-                                           whole_object, vector_iterate_cb,
+-                                           &extents));
+-
+-    // 16. snap3 -> snap1
+-    ASSERT_EQ(-EINVAL, image.diff_iterate2("snap3", 0, size, true,
+-                                           whole_object, vector_iterate_cb,
+-                                           &extents));
+-
+-    ASSERT_PASSED(validate_object_map, image);
+-  }
+ };
+ 
+ template <bool _whole_object>
+@@ -6423,80 +5993,6 @@ TYPED_TEST(DiffIterateTest, DiffIterate)
+   ioctx.close();
+ }
+ 
+-TYPED_TEST(DiffIterateTest, DiffIterateDeterministic)
+-{
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
+-
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic(0, 256));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic((1 << 20) - 256, 256));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic((1 << 20) - 128, 256));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic(1 << 20, 256));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic((4 << 20) - 256, 256));
+-}
+-
+-TYPED_TEST(DiffIterateTest, DiffIterateDeterministicPP)
+-{
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
+-
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_pp(0, 2));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_pp((3 << 20) - 2, 2));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_pp((3 << 20) - 1, 2));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_pp(3 << 20, 2));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_pp((4 << 20) - 2, 2));
+-}
+-
+-#ifdef HAVE_LIBCRYPTSETUP
+-
+-TYPED_TEST(DiffIterateTest, DiffIterateDeterministicLUKS1)
+-{
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
+-
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks1(0, 256));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks1((1 << 20) - 256, 256));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks1((1 << 20) - 128, 256));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks1(1 << 20, 256));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks1((4 << 20) - 256, 256));
+-}
+-
+-TYPED_TEST(DiffIterateTest, DiffIterateDeterministicLUKS1PP)
+-{
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
+-
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks1_pp(0, 2));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks1_pp((3 << 20) - 2, 2));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks1_pp((3 << 20) - 1, 2));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks1_pp(3 << 20, 2));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks1_pp((4 << 20) - 2, 2));
+-}
+-
+-TYPED_TEST(DiffIterateTest, DiffIterateDeterministicLUKS2)
+-{
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
+-
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks2(0, 256));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks2((1 << 20) - 256, 256));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks2((1 << 20) - 128, 256));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks2(1 << 20, 256));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks2((4 << 20) - 256, 256));
+-}
+-
+-TYPED_TEST(DiffIterateTest, DiffIterateDeterministicLUKS2PP)
+-{
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
+-  REQUIRE(!is_feature_enabled(RBD_FEATURE_JOURNALING));
+-
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks2_pp(0, 2));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks2_pp((3 << 20) - 2, 2));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks2_pp((3 << 20) - 1, 2));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks2_pp(3 << 20, 2));
+-  EXPECT_NO_FATAL_FAILURE(this->test_deterministic_luks2_pp((4 << 20) - 2, 2));
+-}
+-
+-#endif // HAVE_LIBCRYPTSETUP
+-
+ TYPED_TEST(DiffIterateTest, DiffIterateDiscard)
+ {
+   REQUIRE(!is_feature_enabled(RBD_FEATURE_STRIPINGV2));
+diff --git a/src/test/librbd/test_main.cc b/src/test/librbd/test_main.cc
+index f871a4e513b3..dc3a66ef5221 100644
+--- a/src/test/librbd/test_main.cc
++++ b/src/test/librbd/test_main.cc
+@@ -12,6 +12,7 @@
+ extern void register_test_librbd();
+ #ifdef TEST_LIBRBD_INTERNALS
+ extern void register_test_deep_copy();
++extern void register_test_diff_iterate();
+ extern void register_test_encryption();
+ extern void register_test_groups();
+ extern void register_test_image_watcher();
+@@ -34,6 +35,7 @@ int main(int argc, char **argv)
+   register_test_librbd();
+ #ifdef TEST_LIBRBD_INTERNALS
+   register_test_deep_copy();
++  register_test_diff_iterate();
+   register_test_encryption();
+   register_test_groups();
+   register_test_image_watcher();

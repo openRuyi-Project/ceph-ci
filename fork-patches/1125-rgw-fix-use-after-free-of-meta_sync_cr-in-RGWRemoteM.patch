@@ -1,0 +1,75 @@
+From 2b9afa6d907a663863c58d95e6f2d07ec8449fb9 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Mon, 29 Jun 2026 19:38:58 -0700
+Subject: [PATCH 09/13] rgw: fix use-after-free of meta_sync_cr in
+ RGWRemoteMetaLog
+
+run_sync() assigned meta_sync_cr = new RGWMetaSyncCR(...) and passed it
+to run(), which drops a reference and frees the coroutine on return. The
+pointer was never reset to NULL and wakeup() ran on another thread, so
+its non-null check passed and it dereferenced a freed object.
+
+Mirror RGWRemoteDataLog: take an extra reference around run(), clear the
+pointer afterwards, and serialize access with a shared_mutex shared
+between run_sync() and wakeup().
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/rgw/driver/rados/rgw_sync.cc | 12 ++++++++++++
+ src/rgw/driver/rados/rgw_sync.h  |  1 +
+ 2 files changed, 13 insertions(+)
+
+diff --git a/src/rgw/driver/rados/rgw_sync.cc b/src/rgw/driver/rados/rgw_sync.cc
+index 810f35b77e3..5adb5f4bc73 100644
+--- a/src/rgw/driver/rados/rgw_sync.cc
++++ b/src/rgw/driver/rados/rgw_sync.cc
+@@ -10,6 +10,8 @@
+ #include "services/svc_mdlog.h"
+ #include "services/svc_cls.h"
+ 
++#include <shared_mutex>
++
+ #include <boost/asio/yield.hpp>
+ 
+ #define dout_subsys ceph_subsys_rgw
+@@ -2404,8 +2406,17 @@ int RGWRemoteMetaLog::run_sync(const DoutPrefixProvider *dpp, optional_yield y,
+         if (r < 0) {
+           return r;
+         }
++          lock.lock();
+           meta_sync_cr = new RGWMetaSyncCR(&sync_env, cursor, sync_status, tn);
++          meta_sync_cr->get(); // run() will drop a ref, so take another
++          lock.unlock();
++
+           r = run(dpp, meta_sync_cr);
++
++          lock.lock();
++          meta_sync_cr->put();
++          meta_sync_cr = NULL;
++          lock.unlock();
+ 	        if (r < 0) {
+ 	          tn->log(0, "ERROR: failed to fetch all metadata keys");
+ 	          return r;
+@@ -2422,6 +2433,7 @@ int RGWRemoteMetaLog::run_sync(const DoutPrefixProvider *dpp, optional_yield y,
+ 
+ void RGWRemoteMetaLog::wakeup(int shard_id)
+ {
++  std::shared_lock rl{lock};
+   if (!meta_sync_cr) {
+     return;
+   }
+diff --git a/src/rgw/driver/rados/rgw_sync.h b/src/rgw/driver/rados/rgw_sync.h
+index 4f8b8e132a8..de5d8496df0 100644
+--- a/src/rgw/driver/rados/rgw_sync.h
++++ b/src/rgw/driver/rados/rgw_sync.h
+@@ -205,6 +205,7 @@ class RGWRemoteMetaLog : public RGWCoroutinesManager {
+   RGWSyncTraceManager *sync_tracer{nullptr};
+ 
+   RGWMetaSyncCR *meta_sync_cr{nullptr};
++  ceph::shared_mutex lock = ceph::make_shared_mutex("RGWRemoteMetaLog::lock");
+ 
+   RGWSyncBackoff backoff;
+ 
+-- 
+2.55.0
+

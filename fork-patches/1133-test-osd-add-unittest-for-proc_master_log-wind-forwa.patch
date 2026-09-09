@@ -1,0 +1,102 @@
+From 754781416c4de4e1ae740c0e919c3f72a45e9ae2 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Sun, 12 Jul 2026 12:40:39 -0700
+Subject: [PATCH 3/3] test/osd: add unittest for proc_master_log wind-forward
+
+proc_master_log's EC-optimizations block must keep an acked partial
+write (recorded in pwlc) when olog is non-empty but its head has been
+wound past its last entry. A normal peering cycle in the test harness
+cannot produce that olog shape, so the test calls proc_master_log
+directly; PeeringStateTest is made a friend of PeeringState to reach it.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/osd/PeeringState.h           |  1 +
+ src/test/osd/TestPeeringState.cc | 52 ++++++++++++++++++++++++++++++++
+ 2 files changed, 53 insertions(+)
+
+diff --git a/src/osd/PeeringState.h b/src/osd/PeeringState.h
+index 94ee299cdfb..315f74eb52e 100644
+--- a/src/osd/PeeringState.h
++++ b/src/osd/PeeringState.h
+@@ -649,6 +649,7 @@ public:
+     }
+   };
+   friend class PeeringMachine;
++  friend class PeeringStateTest;
+ 
+   /* States */
+   // Initial
+diff --git a/src/test/osd/TestPeeringState.cc b/src/test/osd/TestPeeringState.cc
+index 067456f4261..008bb8b6dd7 100644
+--- a/src/test/osd/TestPeeringState.cc
++++ b/src/test/osd/TestPeeringState.cc
+@@ -1196,6 +1196,51 @@ protected:
+       std::nullopt, object_stat_collection_t());
+   }
+ 
++  // Helper - see the ProcMasterLogWindForwardPastOlogTail test.
++  void test_proc_master_log_wind_forward_past_olog_tail()
++  {
++    const int primary = acting[0];
++    test_create_peering_state();
++    test_init();
++    test_event_initialize();
++    eversion_t w1 = test_append_log_entry();                       // full write
++    eversion_t w2 = test_append_log_entry(ss({0, 2, 3}), ss({0, 2, 3}));
++    eversion_t w3 = test_append_log_entry(ss({0, 2, 3}), ss({0, 2, 3}), true);
++
++    auto ps = get_ps(primary);
++    ASSERT_EQ(ps->get_pg_log().get_head(), w3);
++    ASSERT_EQ(ps->get_info().partial_writes_last_complete.at(
++                shard_id_t(1)).second, w2);
++
++    // Shard 2 lags at W1, so the wind-forward loop keeps nothing and pwlc
++    // stays wherever the divergence check left it.
++    pg_info_t pinfo2 = ps->get_info();
++    pinfo2.last_update = pinfo2.last_complete = w1;
++    ps->peer_info[pg_shard_t(2, shard_id_t(2))] = pinfo2;
++
++    // Log from shard 1: only W1, head=W1. apply_pwlc winds olog.head to W2, so
++    // the else branch sees olog.log.back()=W1 < p=W2 <= olog.head=W2.
++    pg_log_t olog;
++    olog.tail = eversion_t();
++    olog.head = w1;
++    olog.log.push_back(ps->get_pg_log().get_log().log.front());
++
++    pg_info_t oinfo = ps->get_info();
++    oinfo.last_update = oinfo.last_complete = w1;
++    oinfo.log_tail = eversion_t();
++    oinfo.partial_writes_last_complete.clear();
++
++    pg_missing_t omissing;
++    ObjectStore::Transaction t;
++    ps->proc_master_log(t, oinfo, std::move(olog), std::move(omissing),
++                        pg_shard_t(1, shard_id_t(1)));
++
++    // Shard 1's pwlc must still be (W1, W2), not rolled back to the log tail.
++    std::map<shard_id_t,std::pair<eversion_t, eversion_t>> expected_pwlc;
++    expected_pwlc[shard_id_t(1)] = std::pair(w1, w2);
++    verify_pwlc(osdmap->get_epoch(), expected_pwlc, primary);
++  }
++
+   // ============================================================================
+   // GTest - Setup and Teardown
+   // ============================================================================
+@@ -2192,6 +2237,13 @@ TEST_F(PeeringStateTest, Issue74218) {
+   verify_logs();
+ }
+ 
++// A normal peering cycle in this harness cannot produce an olog whose head
++// was wound past its last entry, so call proc_master_log directly.
++TEST_F(PeeringStateTest, ProcMasterLogWindForwardPastOlogTail) {
++  dout(0) << "== ProcMasterLogWindForwardPastOlogTail ==" << dendl;
++  test_proc_master_log_wind_forward_past_olog_tail();
++}
++
+ // ============================================================================
+ // Rebuild Stats Perf Counter Tests
+ //
+-- 
+2.55.0
+

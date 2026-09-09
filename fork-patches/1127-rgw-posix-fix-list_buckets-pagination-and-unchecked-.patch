@@ -1,0 +1,55 @@
+From 015e6b03b8065fdd63cf47769f3b3901d45b9fb5 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Mon, 29 Jun 2026 19:42:32 -0700
+Subject: [PATCH 11/13] rgw/posix: fix list_buckets pagination and unchecked
+ load_bucket
+
+Two defects in POSIXBucket listing:
+
+- load_bucket()'s return value was ignored and the bucket pointer was
+  dereferenced unconditionally, risking a null dereference on failure.
+- next_marker was read from ent.bucket.marker after ent had been moved
+  into result.buckets, so the marker was always empty and pagination
+  never advanced.
+
+Check load_bucket() and skip the entry on error, and set next_marker
+from the bucket name captured before the move.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/rgw/driver/posix/rgw_sal_posix.cc | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/rgw/driver/posix/rgw_sal_posix.cc b/src/rgw/driver/posix/rgw_sal_posix.cc
+index 92710d01669..2ea51e617e3 100644
+--- a/src/rgw/driver/posix/rgw_sal_posix.cc
++++ b/src/rgw/driver/posix/rgw_sal_posix.cc
+@@ -2313,6 +2313,12 @@ int POSIXDriver::list_buckets(const DoutPrefixProvider* dpp, const rgw_owner& ow
+     }
+     std::unique_ptr<Bucket> bucket;
+     ret = load_bucket(dpp, rgw_bucket("", entry->d_name), &bucket, null_yield);
++    if (ret < 0) {
++      ldpp_dout(dpp, 0) << "ERROR: failed to load bucket " << entry->d_name
++                        << ": " << ret << dendl;
++      errno = 0;
++      continue;
++    }
+     if (bucket->get_owner() != owner) {
+       continue;
+     }
+@@ -2321,10 +2327,11 @@ int POSIXDriver::list_buckets(const DoutPrefixProvider* dpp, const rgw_owner& ow
+     ent.creation_time = ceph::real_clock::from_time_t(stx.stx_btime.tv_sec);
+     // TODO: ent.size and ent.count
+ 
++    const std::string bucket_name = ent.bucket.name;
+     result.buckets.push_back(std::move(ent));
+     errno = 0;
+     if (result.buckets.size() == max){
+-      result.next_marker = ent.bucket.marker;
++      result.next_marker = bucket_name;
+       break;
+     }
+   }
+-- 
+2.55.0
+

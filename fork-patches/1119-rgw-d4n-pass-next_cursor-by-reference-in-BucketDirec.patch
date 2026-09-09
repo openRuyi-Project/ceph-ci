@@ -1,0 +1,48 @@
+From 7993cf1d6650a2d9b4b8de7c1d736b9d4c87d094 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Mon, 29 Jun 2026 19:37:17 -0700
+Subject: [PATCH 03/13] rgw/d4n: pass next_cursor by reference in
+ BucketDirectory::zscan
+
+zscan() took next_cursor by value, so the cursor written inside the
+function was lost on return. The caller's next_cursor stayed at its
+initial 0, ending the SCAN loop after the first batch and dropping every
+subsequent page for large ordered sets.
+
+Take next_cursor by reference so the updated cursor reaches the caller.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/rgw/driver/d4n/d4n_directory.cc | 2 +-
+ src/rgw/driver/d4n/d4n_directory.h  | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/rgw/driver/d4n/d4n_directory.cc b/src/rgw/driver/d4n/d4n_directory.cc
+index f7c57c21644..c4d51b59ed9 100644
+--- a/src/rgw/driver/d4n/d4n_directory.cc
++++ b/src/rgw/driver/d4n/d4n_directory.cc
+@@ -277,7 +277,7 @@ int BucketDirectory::zrange(const DoutPrefixProvider* dpp, const std::string& bu
+   return 0;
+ }
+ 
+-int BucketDirectory::zscan(const DoutPrefixProvider* dpp, const std::string& bucket_id, uint64_t cursor, const std::string& pattern, uint64_t count, std::vector<std::string>& members, uint64_t next_cursor, optional_yield y)
++int BucketDirectory::zscan(const DoutPrefixProvider* dpp, const std::string& bucket_id, uint64_t cursor, const std::string& pattern, uint64_t count, std::vector<std::string>& members, uint64_t& next_cursor, optional_yield y)
+ {
+   try {
+     boost::system::error_code ec;
+diff --git a/src/rgw/driver/d4n/d4n_directory.h b/src/rgw/driver/d4n/d4n_directory.h
+index 499b73da118..6a708367c17 100644
+--- a/src/rgw/driver/d4n/d4n_directory.h
++++ b/src/rgw/driver/d4n/d4n_directory.h
+@@ -183,7 +183,7 @@ class BucketDirectory: public Directory {
+     int zadd(const DoutPrefixProvider* dpp, const std::string& bucket_id, double score, const std::string& member, optional_yield y, Pipeline* pipeline=nullptr);
+     int zrem(const DoutPrefixProvider* dpp, const std::string& bucket_id, const std::string& member, optional_yield y);
+     int zrange(const DoutPrefixProvider* dpp, const std::string& bucket_id, const std::string& start, const std::string& stop, uint64_t offset, uint64_t count, std::vector<std::string>& members, optional_yield y);
+-    int zscan(const DoutPrefixProvider* dpp, const std::string& bucket_id, uint64_t cursor, const std::string& pattern, uint64_t count, std::vector<std::string>& members, uint64_t next_cursor, optional_yield y);
++    int zscan(const DoutPrefixProvider* dpp, const std::string& bucket_id, uint64_t cursor, const std::string& pattern, uint64_t count, std::vector<std::string>& members, uint64_t& next_cursor, optional_yield y);
+     int zrank(const DoutPrefixProvider* dpp, const std::string& bucket_id, const std::string& member, uint64_t& rank, optional_yield y);
+     int del(const DoutPrefixProvider* dpp, const std::string& bucket_id, optional_yield y);
+ 
+-- 
+2.55.0
+

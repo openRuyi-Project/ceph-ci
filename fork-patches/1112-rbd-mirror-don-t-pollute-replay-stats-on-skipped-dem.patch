@@ -1,0 +1,41 @@
+From cdd0dfb9132ef800235faf8abda167795805e781 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Mon, 6 Jul 2026 19:07:04 -0700
+Subject: [PATCH 10/13] rbd-mirror: don't pollute replay stats on skipped
+ demotion event
+
+When allocate_local_tag() skips a stale demotion event it commits via
+handle_process_entry_safe() using m_replay_bytes and m_replay_start_time,
+which hold the previous entry's values -- or, for the first entry,
+m_replay_start_time is utime_t(), making the reported latency roughly the
+current Unix timestamp and wrecking the replay-latency average.
+
+Report zero bytes and ceph_clock_now() (zero latency) for the skipped
+entry.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/tools/rbd_mirror/image_replayer/journal/Replayer.cc | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/tools/rbd_mirror/image_replayer/journal/Replayer.cc b/src/tools/rbd_mirror/image_replayer/journal/Replayer.cc
+index cb37e7ea089..7f1a423aecb 100644
+--- a/src/tools/rbd_mirror/image_replayer/journal/Replayer.cc
++++ b/src/tools/rbd_mirror/image_replayer/journal/Replayer.cc
+@@ -991,8 +991,11 @@ void Replayer<I>::allocate_local_tag() {
+          local_tag_data.predecessor.mirror_uuid ==
+            librbd::Journal<>::LOCAL_MIRROR_UUID)) {
+       dout(15) << "skipping stale demotion event" << dendl;
+-      handle_process_entry_safe(m_replay_entry, m_replay_bytes,
+-                                m_replay_start_time, 0);
++      // this entry is committed without being preprocessed/replayed, so
++      // m_replay_bytes and m_replay_start_time still hold the previous
++      // entry's (or uninitialized) values; report no bytes and zero
++      // latency to avoid polluting the replay stats
++      handle_process_entry_safe(m_replay_entry, 0, ceph_clock_now(), 0);
+       handle_replay_ready();
+       return;
+     } else {
+-- 
+2.55.0
+

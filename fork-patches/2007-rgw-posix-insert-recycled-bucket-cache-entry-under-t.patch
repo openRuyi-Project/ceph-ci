@@ -1,0 +1,36 @@
+From d0037d1653d660b0e4bc12036f76f88148c7e3cf Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Tue, 23 Jun 2026 00:14:39 +0800
+Subject: [PATCH 2/2] rgw/posix: insert recycled bucket cache entry under the
+ partition lock
+
+get_bucket()'s recycle path unlocked the partition lock before calling
+cache.insert(), racing find_latch() on the AVL tree. The corrupted tree
+and its size counter then hung TreeX::drain() at teardown. The lock is
+still held and fac.hk maps to the same partition, so insert under it
+(FLAG_NONE) and release after; re-locking would invert the lock order.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/rgw/driver/posix/bucket_cache.h | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/rgw/driver/posix/bucket_cache.h b/src/rgw/driver/posix/bucket_cache.h
+index b0a2aacbf02..bd169f5f6a7 100644
+--- a/src/rgw/driver/posix/bucket_cache.h
++++ b/src/rgw/driver/posix/bucket_cache.h
+@@ -362,9 +362,9 @@ public:
+ 	    /* inserts at cached insert iterator, releasing latch */
+ 	    cache.insert_latched(b, lat, BucketCacheEntry<D, B>::bucket_avl_cache::FLAG_UNLOCK);
+ 	  } else {
+-	    /* recycle step invalidates Latch */
+-	    lat.lock->unlock(); /* !LATCHED */
++	    /* recycle invalidated the Latch; re-insert under the held partition lock */
+ 	    cache.insert(fac.hk, b, BucketCacheEntry<D, B>::bucket_avl_cache::FLAG_NONE);
++	    lat.lock->unlock(); /* !LATCHED */
+ 	  }
+ 	  get<1>(result) |= BucketCache<D, B>::FLAG_CREATE;
+ 	} else {
+-- 
+2.54.0
+

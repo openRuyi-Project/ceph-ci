@@ -1,0 +1,43 @@
+From a5be6d5213096cb01134ac74a35a06d2751462ff Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Thu, 25 Jun 2026 22:17:09 +0800
+Subject: [PATCH 7/7] osd: avoid inserting empty OI_ATTR in rollback_setattrs
+
+operator[] on a missing OI_ATTR inserted an empty bufferlist, then
+decode threw; look it up and bail if absent.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/osd/PGBackend.cc | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/osd/PGBackend.cc b/src/osd/PGBackend.cc
+index 053836c7e33..714352b59f8 100644
+--- a/src/osd/PGBackend.cc
++++ b/src/osd/PGBackend.cc
+@@ -772,8 +772,12 @@ void PGBackend::rollback_setattrs(
+     }
+   }
+   if (only_oi) {
++    auto oi_iter = to_set.find(OI_ATTR);
++    if (oi_iter == to_set.end()) {
++      return;
++    }
+     object_info_t oi;
+-    auto p = to_set[OI_ATTR].cbegin();
++    auto p = oi_iter->second.cbegin();
+     decode(oi, p);
+ 
+     shard_id_t my_shard = get_parent()->whoami_shard().shard;
+@@ -794,7 +798,7 @@ void PGBackend::rollback_setattrs(
+         coll,
+         ghobject_t(hoid, ghobject_t::NO_GEN, my_shard),
+         OI_ATTR,
+-        to_set[OI_ATTR]);
++        oi_iter->second);
+     }
+   } else {
+     t->setattrs(
+-- 
+2.54.0
+

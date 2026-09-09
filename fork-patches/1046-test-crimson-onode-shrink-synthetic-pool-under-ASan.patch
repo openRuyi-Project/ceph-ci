@@ -1,0 +1,52 @@
+From feb00ff12f715598acd24b598d1b1c2c4efa48f6 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Tue, 23 Jun 2026 22:11:58 +0800
+Subject: [PATCH] test/crimson/onode: shrink synthetic pool under ASan
+
+2_synthetic builds a 10000-onode tree and full-scans it several times
+(create, validate, list, modify, erase across restart), which dominates
+the ASan run. The onode value is a fixed-size onode_layout_t, so tree
+fanout is constant and only the count drives depth; 2000 onodes still
+build a multi-level tree exercising the same split/merge and manager
+paths with far fewer instrumented traversals.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ .../onode_tree/test_fltree_onode_manager.cc        | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/test/crimson/seastore/onode_tree/test_fltree_onode_manager.cc b/src/test/crimson/seastore/onode_tree/test_fltree_onode_manager.cc
+index c29a71ab384..57c955b023a 100644
+--- a/src/test/crimson/seastore/onode_tree/test_fltree_onode_manager.cc
++++ b/src/test/crimson/seastore/onode_tree/test_fltree_onode_manager.cc
+@@ -23,6 +23,18 @@ namespace {
+   }
+ }
+ 
++// Onode value is fixed-size, so only count drives tree depth; under ASan a
++// smaller pool still builds a multi-level tree with far fewer traversals.
++#ifndef __has_feature
++#define __has_feature(x) 0
++#endif
++#if __has_feature(address_sanitizer) || defined(__SANITIZE_ADDRESS__)
++static constexpr bool onode_under_asan = true;
++#else
++static constexpr bool onode_under_asan = false;
++#endif
++static constexpr unsigned synthetic_onode_count = onode_under_asan ? 2000 : 10000;
++
+ struct onode_item_t {
+   uint32_t size;
+   uint64_t id;
+@@ -265,7 +277,7 @@ TEST_P(fltree_onode_manager_test_t, 2_synthetic)
+   run_async([this] {
+     uint64_t block_size = tm->get_block_size();
+     auto pool = KVPool<onode_item_t>::create_range(
+-        {0, 10000}, {32, 64, 128, 256, 512}, block_size);
++        {0, synthetic_onode_count}, {32, 64, 128, 256, 512}, block_size);
+     auto start = pool.begin();
+     auto end = pool.end();
+     with_onodes_write(start, end,
+-- 
+2.54.0
+

@@ -1,0 +1,39 @@
+From 9e7ad3341493b20b96edf55d1eeee63ee9885ac0 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Mon, 29 Jun 2026 19:37:24 -0700
+Subject: [PATCH 04/13] rgw/d4n: fix operator precedence in LFUDA sync error
+ checks
+
+if (int ret = age_sync(dpp, y) < 0) binds as ret = (age_sync(...) < 0)
+because < has higher precedence than =, so ret was always 0 or 1 and the
+real error code was lost from the log. Use a C++17 init-statement so ret
+holds the actual return value.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/rgw/driver/d4n/d4n_policy.cc | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/rgw/driver/d4n/d4n_policy.cc b/src/rgw/driver/d4n/d4n_policy.cc
+index 45122f5436c..c080efede18 100644
+--- a/src/rgw/driver/d4n/d4n_policy.cc
++++ b/src/rgw/driver/d4n/d4n_policy.cc
+@@ -224,12 +224,12 @@ asio::awaitable<void> LFUDAPolicy::redis_sync(const DoutPrefixProvider* dpp, opt
+ 
+   for (;;) try {
+     /* Update age */
+-    if (int ret = age_sync(dpp, y) < 0) {
++    if (int ret = age_sync(dpp, y); ret < 0) {
+       ldpp_dout(dpp, 0) << "LFUDAPolicy::" << __func__ << "() ERROR: " << ret << dendl;
+     }
+-    
++
+     /* Update minimum local weight sum */
+-    if (int ret = local_weight_sync(dpp, y) < 0) {
++    if (int ret = local_weight_sync(dpp, y); ret < 0) {
+       ldpp_dout(dpp, 0) << "LFUDAPolicy::" << __func__ << "() ERROR: " << ret << dendl;
+     }
+ 
+-- 
+2.55.0
+

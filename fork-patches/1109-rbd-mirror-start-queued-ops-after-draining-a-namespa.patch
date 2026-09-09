@@ -1,0 +1,69 @@
+From 86cfa6f9104c92b591f17546c21c1cc759b90408 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Mon, 6 Jul 2026 19:05:27 -0700
+Subject: [PATCH 07/13] rbd-mirror: start queued ops after draining a namespace
+
+Throttler::drain() erases a namespace's in-flight ops but, unlike
+finish_op(), never promotes ops queued for other namespaces into the
+freed slots. The next start_op() then takes the free-slot branch and
+trips ceph_assert(m_queue.empty()), aborting the daemon, while the queued
+sync starves. Reached when one namespace fills the shared concurrency
+limit, another has a sync queued, and the first loses leadership.
+
+After removing the drained ops, start queued ops to fill the freed slots,
+as set_max_concurrent_ops() does.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/tools/rbd_mirror/Throttler.cc | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/src/tools/rbd_mirror/Throttler.cc b/src/tools/rbd_mirror/Throttler.cc
+index ac36d5e0f2b..d2b2821ee80 100644
+--- a/src/tools/rbd_mirror/Throttler.cc
++++ b/src/tools/rbd_mirror/Throttler.cc
+@@ -153,6 +153,7 @@ void Throttler<I>::drain(const std::string &ns, int r) {
+   dout(20) << "ns=" << ns << dendl;
+ 
+   std::map<Id, Context *> queued_ops;
++  std::list<Context *> start_ops;
+   {
+     std::lock_guard locker{m_lock};
+     for (auto it = m_queued_ops.begin(); it != m_queued_ops.end(); ) {
+@@ -172,12 +173,33 @@ void Throttler<I>::drain(const std::string &ns, int r) {
+         it++;
+       }
+     }
++
++    // start ops still queued for other namespaces in the slots freed
++    // above, preserving the invariant asserted by start_op() that the
++    // queue is empty whenever a free slot exists
++    while ((m_max_concurrent_ops == 0 ||
++            m_inflight_ops.size() < m_max_concurrent_ops) &&
++           !m_queue.empty()) {
++      auto id = m_queue.front();
++      m_inflight_ops.insert(id);
++      dout(20) << "ready to start op for " << id << " ["
++               << m_inflight_ops.size() << "/" << m_max_concurrent_ops << "]"
++               << dendl;
++      auto it = m_queued_ops.find(id);
++      ceph_assert(it != m_queued_ops.end());
++      start_ops.push_back(it->second);
++      m_queued_ops.erase(it);
++      m_queue.pop_front();
++    }
+   }
+ 
+   for (auto &it : queued_ops) {
+     dout(20) << "queued_op " << it.first << dendl;
+     it.second->complete(r);
+   }
++  for (const auto& ctx : start_ops) {
++    ctx->complete(0);
++  }
+ }
+ 
+ template <typename I>
+-- 
+2.55.0
+

@@ -1,0 +1,31 @@
+From 04a81d4ccd3ff71bc059be674f83690cbccf3fee Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Tue, 23 Jun 2026 00:14:39 +0800
+Subject: [PATCH 1/2] common/cohort_lru: clear active flag when object returns
+ to lane.q
+
+unref() returns an object to lane.q when its refcount drops to the sentinel
+value but left the active flag set, so a later ref()/unref() consulted a
+stale flag and erased the object from the wrong intrusive list. Clear it to
+keep the flag consistent with which queue the object is on.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/common/cohort_lru.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/common/cohort_lru.h b/src/common/cohort_lru.h
+index b8bc1eb1436..83dce2d5748 100644
+--- a/src/common/cohort_lru.h
++++ b/src/common/cohort_lru.h
+@@ -237,6 +237,7 @@ namespace cohort {
+             auto active = o->active.test();
+             if (active) {
+               lane.active.erase(it);
++              o->active.clear(); /* now on lane.q */
+             } else {
+               lane.q.erase(it);
+             }
+-- 
+2.54.0
+

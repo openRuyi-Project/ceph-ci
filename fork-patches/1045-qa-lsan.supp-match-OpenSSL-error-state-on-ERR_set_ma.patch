@@ -1,0 +1,34 @@
+From ae80e6798f991efdbe2f8534086721f8d888bb56 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Mon, 31 Aug 2026 20:57:15 -0700
+Subject: [PATCH] qa/lsan.supp: match OpenSSL error state on ERR_set_mark
+
+ossl_err_get_state_int is unexported, so the existing entry never
+matches and unittest_librbd fails on the error state
+EVP_get_cipherbyname() leaves behind. Match its exported caller
+ERR_set_mark instead.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ qa/lsan.supp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/qa/lsan.supp b/qa/lsan.supp
+index df0897fc96e..2a145a9a193 100644
+--- a/qa/lsan.supp
++++ b/qa/lsan.supp
+@@ -64,8 +64,11 @@ leak:libcryptsetup
+ leak:^RAND_bytes_ex
+ leak:^RAND_priv_bytes_ex
+ # OpenSSL per-thread error stack/strings, freed only by OPENSSL_thread_stop.
++# ossl_err_get_state_int is internal, so a stripped .dynsym leaves
++# only its exported caller ERR_set_mark to match on.
+ leak:^ossl_err_get_state_int
+ leak:^ERR_add_error_vdata
++leak:^ERR_set_mark
+ 
+ # unittest-seastore stops the seastar reactor (SeastarRunner, on its own thread)
+ # without draining its pending tasks, so a few cached extents those tasks still
+-- 
+2.55.0
+

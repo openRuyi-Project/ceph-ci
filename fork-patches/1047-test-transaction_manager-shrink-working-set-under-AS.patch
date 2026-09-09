@@ -1,0 +1,96 @@
+From 3e5e5162a8ce77bae687ba94f423eb106ad8ae05 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Wed, 24 Jun 2026 00:25:57 +0800
+Subject: [PATCH] test/transaction_manager: shrink working set under ASan
+
+random_writes, random_writes_concurrent and parallel_extent_read build a
+fixed working set of 4KiB extents and then replay the journal and full-scan
+the LBA tree, which dominates the ASan run. The set only needs to stay above
+the LBA leaf capacity to keep a multi-level tree, so under ASan halve it (and
+the random_writes replay rounds and the concurrent mutate target), exercising
+the same split/merge/replay paths with far fewer instrumented operations.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ .../seastore/test_transaction_manager.cc      | 26 +++++++++++++++----
+ 1 file changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/src/test/crimson/seastore/test_transaction_manager.cc b/src/test/crimson/seastore/test_transaction_manager.cc
+index 59105ae842e..7294cbf56b0 100644
+--- a/src/test/crimson/seastore/test_transaction_manager.cc
++++ b/src/test/crimson/seastore/test_transaction_manager.cc
+@@ -26,6 +26,18 @@ namespace {
+   }
+ }
+ 
++// Under ASan, halve the working set to cut instrumented ops; it still fills
++// several LBA leaves, keeping the same multi-level split/merge/replay path.
++#ifndef __has_feature
++#define __has_feature(x) 0
++#endif
++#if __has_feature(address_sanitizer) || defined(__SANITIZE_ADDRESS__)
++static constexpr bool tm_under_asan = true;
++#else
++static constexpr bool tm_under_asan = false;
++#endif
++static constexpr size_t tm_working_set_total = tm_under_asan ? (2<<20) : (4<<20);
++
+ laddr_t get_laddr_hint(uint64_t offset) {
+   return laddr_t::from_byte_offset(RootMetaBlock::SIZE + offset);
+ }
+@@ -923,7 +935,7 @@ struct transaction_manager_test_t :
+   }
+ 
+   void test_parallel_extent_read() {
+-    constexpr size_t TOTAL = 4<<20;
++    constexpr size_t TOTAL = tm_working_set_total;
+     constexpr size_t BSIZE = 4<<10;
+     constexpr size_t BLOCKS = TOTAL / BSIZE;
+     run_async([this] {
+@@ -958,8 +970,10 @@ struct transaction_manager_test_t :
+   void test_random_writes_concurrent() {
+     constexpr unsigned WRITE_STREAMS = 256;
+ 
+-    constexpr size_t TOTAL = 4<<20;
++    constexpr size_t TOTAL = tm_working_set_total;
+     constexpr size_t BSIZE = 4<<10;
++    // halve mutate target under ASan; same concurrent submit/retry path.
++    constexpr int WRITE_TARGET = tm_under_asan ? 150 : 300;
+     constexpr size_t BLOCKS = TOTAL / BSIZE;
+     run_async([this] {
+       std::for_each(
+@@ -987,7 +1001,7 @@ struct transaction_manager_test_t :
+         boost::make_counting_iterator(WRITE_STREAMS),
+         [&](auto) {
+           return seastar::async([&] {
+-            while (writes < 300) {
++            while (writes < WRITE_TARGET) {
+               auto t = create_transaction();
+               auto ext = try_get_extent(
+                 t,
+@@ -2147,10 +2161,12 @@ TEST_P(tm_single_device_test_t, cause_lba_split)
+ 
+ TEST_P(tm_single_device_test_t, random_writes)
+ {
+-  constexpr size_t TOTAL = 4<<20;
++  constexpr size_t TOTAL = tm_working_set_total;
+   constexpr size_t BSIZE = 4<<10;
+   constexpr size_t PADDING_SIZE = 256<<10;
+   constexpr size_t BLOCKS = TOTAL / BSIZE;
++  // each round replays + full-scans the tree; halve the rounds under ASan.
++  constexpr unsigned ROUNDS = tm_under_asan ? 2 : 4;
+   run_async([this] {
+     for (unsigned i = 0; i < BLOCKS; ++i) {
+       auto t = create_transaction();
+@@ -2162,7 +2178,7 @@ TEST_P(tm_single_device_test_t, random_writes)
+       submit_transaction(std::move(t));
+     }
+ 
+-    for (unsigned i = 0; i < 4; ++i) {
++    for (unsigned i = 0; i < ROUNDS; ++i) {
+       for (unsigned j = 0; j < 65; ++j) {
+ 	auto t = create_transaction();
+ 	for (unsigned k = 0; k < 2; ++k) {
+-- 
+2.54.0
+

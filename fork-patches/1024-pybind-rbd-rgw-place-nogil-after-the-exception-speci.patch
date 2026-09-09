@@ -1,0 +1,56 @@
+From fbb49ea73b4fb38ea0fa342164251bd5e585b883 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Tue, 16 Jun 2026 04:10:39 +0800
+Subject: [PATCH 5/6] pybind/rbd,rgw: place nogil after the exception
+ specification
+
+Cython 3 warns that putting nogil before except/noexcept is deprecated:
+
+  warning: c_rbd.pxd:634:48: The keyword 'nogil' should appear at the end of the function signature line. Placing it before 'except' or 'noexcept' will be disallowed in a future version of Cython.
+  warning: c_rbd.pxd:639:49: The keyword 'nogil' should appear at the end of the function signature line. Placing it before 'except' or 'noexcept' will be disallowed in a future version of Cython.
+  warning: c_rgw.pxd:105:139: The keyword 'nogil' should appear at the end of the function signature line. Placing it before 'except' or 'noexcept' will be disallowed in a future version of Cython.
+
+Reorder to "except? -9000 nogil", which is accepted by both Cython 0.x
+and Cython 3.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/pybind/rbd/c_rbd.pxd | 4 ++--
+ src/pybind/rgw/c_rgw.pxd | 2 +-
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/pybind/rbd/c_rbd.pxd b/src/pybind/rbd/c_rbd.pxd
+index ae42d0bf19a..0402e991a24 100644
+--- a/src/pybind/rbd/c_rbd.pxd
++++ b/src/pybind/rbd/c_rbd.pxd
+@@ -631,12 +631,12 @@ cdef extern from "rbd/librbd.h" nogil:
+                          uint64_t ofs, uint64_t len,
+                          uint8_t include_parent, uint8_t whole_object,
+                          int (*cb)(uint64_t, size_t, int, void *)
+-                             nogil except? -9000,
++                             except? -9000 nogil,
+                          void *arg) except? -9000
+     int rbd_diff_iterate3(rbd_image_t image, uint64_t from_snap_id,
+                           uint64_t ofs, uint64_t len, uint32_t flags,
+                           int (*cb)(uint64_t, size_t, int, void *)
+-                              nogil except? -9000,
++                              except? -9000 nogil,
+                           void *arg) except? -9000
+ 
+     int rbd_flush(rbd_image_t image)
+diff --git a/src/pybind/rgw/c_rgw.pxd b/src/pybind/rgw/c_rgw.pxd
+index 4654460ed64..d6c072d31c2 100644
+--- a/src/pybind/rgw/c_rgw.pxd
++++ b/src/pybind/rgw/c_rgw.pxd
+@@ -102,7 +102,7 @@ cdef extern from "rados/rgw_file.h" nogil:
+ 
+     int rgw_readdir(rgw_fs *fs,
+                     rgw_file_handle *parent_fh, uint64_t *offset,
+-                    int (*cb)(const char *name, void *arg, uint64_t offset, stat *st, uint32_t st_mask, uint32_t flags) nogil except? -9000,
++                    int (*cb)(const char *name, void *arg, uint64_t offset, stat *st, uint32_t st_mask, uint32_t flags) except? -9000 nogil,
+                     void *cb_arg, bool *eof, uint32_t flags) except? -9000
+ 
+     int rgw_getattr(rgw_fs *fs,
+-- 
+2.54.0
+

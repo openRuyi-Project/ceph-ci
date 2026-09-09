@@ -1,0 +1,44 @@
+From 00891c6ac20e8c2889f09df96dac29738bcb91a0 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Sat, 22 Aug 2026 22:58:48 -0700
+Subject: [PATCH] cmake/boost: don't pass context-impl to the headers step
+
+Since d56d3ea3b69 `headers` runs as a separate b2 step. With WITH_ASAN
+that command line carries context-impl=ucontext but not the
+libs/context/build target that declares the feature, so b2 fails with
+"unknown feature <context-impl>".
+
+Move the ASan properties into boost_features, which only the stage and
+install commands use.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ cmake/modules/BuildBoost.cmake | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/cmake/modules/BuildBoost.cmake b/cmake/modules/BuildBoost.cmake
+index 3dca94814d6..628803ddeeb 100644
+--- a/cmake/modules/BuildBoost.cmake
++++ b/cmake/modules/BuildBoost.cmake
+@@ -156,12 +156,14 @@ function(do_build_boost root_dir version)
+   set(b2_targets stage)
+   set(b2_install_targets install)
+   if(WITH_ASAN)
+-    list(APPEND b2 context-impl=ucontext)
++    # via boost_features, not ${b2}: the `headers` step lacks the
++    # libs/context/build target below
++    list(APPEND boost_features context-impl=ucontext)
+     # build the library with the BOOST_USE_ASAN consumers get from Boost::context,
+     # so fiber_activation_record has one layout (else heap-buffer-overflow)
+-    list(APPEND b2 define=BOOST_USE_ASAN)
+-    # `context-impl` is declared in libs/context/build/Jamfile.v2; the headers/stage
+-    # and install targets never load it, so b2 aborts with `unknown feature
++    list(APPEND boost_features define=BOOST_USE_ASAN)
++    # `context-impl` is declared in libs/context/build/Jamfile.v2; the stage and
++    # install targets never load it, so b2 aborts with `unknown feature
+     # "<context-impl>"`. Name the context project as a target so its Jamfile loads
+     # the feature first.
+     list(PREPEND b2_targets libs/context/build)
+-- 
+2.55.0
+

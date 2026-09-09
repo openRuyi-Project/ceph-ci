@@ -1,0 +1,81 @@
+From 4225ef66618189d4f98daf3d2920c7d4d50f6828 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Tue, 2 Jun 2026 13:07:31 +0800
+Subject: [PATCH 2/3] test: add RISC-V architecture probe tests
+
+Add RISC-V ZBC/ZVBC extension checks to test_arch.cc.
+
+Normalize riscv.c probe results to 0/1,
+so the test comparison works consistently with other architectures.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/arch/riscv.c      |  6 ++++--
+ src/test/test_arch.cc | 28 ++++++++++++++++++++++++++++
+ 2 files changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/src/arch/riscv.c b/src/arch/riscv.c
+index 5dc54acfd86..a106869a233 100644
+--- a/src/arch/riscv.c
++++ b/src/arch/riscv.c
+@@ -36,7 +36,9 @@ void ceph_arch_riscv_probe(void)
+     if (do_hwprobe(pairs, 1) == 0) {
+         unsigned long long ext = pairs[0].value;
+         ceph_arch_riscv_rvv  = (ext & RISCV_HWPROBE_IMA_V);
+-        ceph_arch_riscv_zbc  = (ext & RISCV_HWPROBE_EXT_ZBC);
+-        ceph_arch_riscv_zvbc = (ext & RISCV_HWPROBE_EXT_ZVBC);
++        ceph_arch_riscv_zbc =
++            (ext & RISCV_HWPROBE_EXT_ZBC) == RISCV_HWPROBE_EXT_ZBC;
++        ceph_arch_riscv_zvbc =
++            (ext & RISCV_HWPROBE_EXT_ZVBC) == RISCV_HWPROBE_EXT_ZVBC;
+     }
+ }
+diff --git a/src/test/test_arch.cc b/src/test/test_arch.cc
+index 63a038050e3..ed349f8bd34 100644
+--- a/src/test/test_arch.cc
++++ b/src/test/test_arch.cc
+@@ -20,6 +20,7 @@
+ #include "arch/probe.h"
+ #include "arch/intel.h"
+ #include "arch/arm.h"
++#include "arch/riscv.h"
+ #include "global/global_context.h"
+ #include "gtest/gtest.h"
+ 
+@@ -82,6 +83,33 @@ TEST(Arch, all)
+ #endif
+ 
+ #endif
++
++#if __riscv && __linux__
++  char isa[FLAGS_SIZE];
++  FILE *f_isa = popen("grep '^isa[	 ]*:' /proc/cpuinfo | head -1", "r");
++  if (f_isa == NULL || fgets(isa, FLAGS_SIZE - 1, f_isa) == NULL) {
++    if (f_isa)
++      pclose(f_isa);
++    return;
++  }
++  pclose(f_isa);
++  // Replace '_' with ' ' so we can match extensions with strstr(" ext ")
++  for (char *p = isa; *p; p++) {
++    if (*p == '_')
++      *p = ' ';
++  }
++  size_t isa_len = strlen(isa);
++  if (isa_len > 0 && isa[isa_len - 1] == '\n')
++    isa[isa_len - 1] = ' ';
++
++  int expected;
++
++  expected = strstr(isa, " zbc ") ? 1 : 0;
++  EXPECT_EQ(expected, ceph_arch_riscv_zbc);
++
++  expected = strstr(isa, " zvbc ") ? 1 : 0;
++  EXPECT_EQ(expected, ceph_arch_riscv_zvbc);
++#endif
+ }
+ 
+ 
+-- 
+2.54.0
+

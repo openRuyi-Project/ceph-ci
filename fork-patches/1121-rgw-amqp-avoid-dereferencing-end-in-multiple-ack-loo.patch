@@ -1,0 +1,32 @@
+From 6ff51b6352435b60ff4e8a6ad2d0cd96604e5e90 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Mon, 29 Jun 2026 19:38:02 -0700
+Subject: [PATCH 05/13] rgw/amqp: avoid dereferencing end() in multiple-ack
+ loop
+
+The multiple-ack loop tested it->tag before it != end(), so once erase()
+returned end() the next iteration dereferenced the end iterator (UB).
+This happens whenever the acked tag is the last callback in the list.
+Check the iterator against end() before dereferencing it.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/rgw/rgw_amqp.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/rgw/rgw_amqp.cc b/src/rgw/rgw_amqp.cc
+index 89af115ceb0..86825225e3e 100644
+--- a/src/rgw/rgw_amqp.cc
++++ b/src/rgw/rgw_amqp.cc
+@@ -793,7 +793,7 @@ private:
+             // n/ack all up to (and including) the tag
+             ldout(cct, 20) << "AMQP run: multiple n/acks received with tag=" << tag << " and result=" << result << dendl;
+             auto it = conn->callbacks.begin();
+-            while (it->tag <= tag && it != conn->callbacks.end()) {
++            while (it != conn->callbacks.end() && it->tag <= tag) {
+               ldout(cct, 20) << "AMQP run: invoking callback with tag=" << it->tag << dendl;
+               it->cb(result);
+               it = conn->callbacks.erase(it);
+-- 
+2.55.0
+

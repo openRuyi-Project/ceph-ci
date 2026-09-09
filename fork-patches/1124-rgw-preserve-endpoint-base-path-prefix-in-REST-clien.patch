@@ -1,0 +1,36 @@
+From 745084e675d649130175d485c7cf38c6f907242f Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Mon, 29 Jun 2026 19:38:44 -0700
+Subject: [PATCH 08/13] rgw: preserve endpoint base path prefix in REST client
+ request
+
+RGWRESTGenerateHTTPHeaders::init() called endpoint.set_path(resource),
+which replaces the whole URL path and drops any base path prefix carried
+by a zone endpoint configured as http://host/prefix/. The signed
+script_uri still included the prefix, so the request path and signature
+disagreed, yielding SignatureDoesNotMatch or 404.
+
+Build the endpoint path from resource_prefix and resource to match
+script_uri.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/rgw/rgw_rest_client.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/rgw/rgw_rest_client.cc b/src/rgw/rgw_rest_client.cc
+index 02b80c2f1ed..825c8db9032 100644
+--- a/src/rgw/rgw_rest_client.cc
++++ b/src/rgw/rgw_rest_client.cc
+@@ -573,7 +573,7 @@ void RGWRESTGenerateHTTPHeaders::init(const string& _method, const string& host,
+   }
+ 
+   endpoint = _endpoint;
+-  endpoint.set_path(resource);
++  endpoint.set_path("/" + resource_prefix + resource);
+   endpoint.set_query(params_str);
+ 
+   const std::string date_str = get_gmt_date_str();
+-- 
+2.55.0
+

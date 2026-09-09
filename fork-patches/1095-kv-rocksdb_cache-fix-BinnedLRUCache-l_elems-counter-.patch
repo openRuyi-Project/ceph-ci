@@ -1,0 +1,70 @@
+From 0d775181afae858e48adb5a1d12e468d1253673d Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Wed, 1 Jul 2026 03:10:11 -0700
+Subject: [PATCH] kv/rocksdb_cache: fix BinnedLRUCache l_elems counter drift
+
+The l_elems perf counter is meant to mirror the number of entries in
+the shard hash table (BinnedLRUHandleTable::elems_), which is only
+adjusted when an entry is actually added or removed:
+  - Insert bumps elems_ only for a new key (old == nullptr)
+  - Remove drops elems_ only when the key was found
+
+The instrumentation added in cadd4a4f6cc updated l_elems
+unconditionally, so it drifted from the real count:
+  - Insert did l_elems++ before the capacity / strict-limit
+    no-insert paths and for same-key replacements, over-counting.
+  - Erase did l_elems-- even when the key was absent and nothing
+    was removed, under-counting and underflowing the uint64 value.
+
+Move the increment into the brand-new-key branch and the decrement
+into the entry-found branch so l_elems tracks elems_ exactly.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/kv/rocksdb_cache/BinnedLRUCache.cc | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/kv/rocksdb_cache/BinnedLRUCache.cc b/src/kv/rocksdb_cache/BinnedLRUCache.cc
+index be51b0325a9..e05b53b8290 100644
+--- a/src/kv/rocksdb_cache/BinnedLRUCache.cc
++++ b/src/kv/rocksdb_cache/BinnedLRUCache.cc
+@@ -445,7 +445,6 @@ rocksdb::Status BinnedLRUCacheShard::Insert(const rocksdb::Slice& key, uint32_t
+ 
+   {
+     std::lock_guard<std::mutex> l(mutex_);
+-    stats[l_elems]++;
+     stats[l_inserts]++;
+     // Free the space following strict LRU policy until enough space
+     // is freed or the lru list is empty
+@@ -471,6 +470,7 @@ rocksdb::Status BinnedLRUCacheShard::Insert(const rocksdb::Slice& key, uint32_t
+       BinnedLRUHandle* old = table_.Insert(e);
+       usage_ += e->charge;
+       if (old != nullptr) {
++        // replacing an existing entry, elem count unchanged
+         old->SetInCache(false);
+         if (Unref(old)) {
+           usage_ -= old->charge;
+@@ -481,6 +481,9 @@ rocksdb::Status BinnedLRUCacheShard::Insert(const rocksdb::Slice& key, uint32_t
+           old->next = deleted;
+           deleted = old;
+         }
++      } else {
++        // brand new key added to the table
++        stats[l_elems]++;
+       }
+       if (handle == nullptr) {
+         LRU_Insert(e);
+@@ -503,9 +506,9 @@ void BinnedLRUCacheShard::Erase(const rocksdb::Slice& key, uint32_t hash) {
+   bool last_reference = false;
+   {
+     std::lock_guard<std::mutex> l(mutex_);
+-    stats[l_elems]--;
+     e = table_.Remove(key, hash);
+     if (e != nullptr) {
++      stats[l_elems]--;
+       last_reference = Unref(e);
+       if (last_reference) {
+         usage_ -= e->charge;
+-- 
+2.54.0
+

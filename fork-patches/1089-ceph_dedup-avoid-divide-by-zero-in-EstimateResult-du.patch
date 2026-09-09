@@ -1,0 +1,45 @@
+From 8a40c83f77e5554713c4c4026328bee7a3fb109d Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Wed, 1 Jul 2026 02:59:15 -0700
+Subject: [PATCH 05/10] ceph_dedup: avoid divide-by-zero in
+ EstimateResult::dump
+
+When an estimate produced no chunks, chunk_statistics is empty and
+dedup_objects is 0, so `total_bytes / dedup_objects` and
+`sqrt(sqsum / dedup_objects)` triggered an integer divide-by-zero
+(SIGFPE); total_bytes / total_objects could likewise be 0. Guard
+each division and emit 0 for the degenerate case.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/tools/ceph_dedup/ceph_dedup_tool.cc | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/tools/ceph_dedup/ceph_dedup_tool.cc b/src/tools/ceph_dedup/ceph_dedup_tool.cc
+index 09b9cdf7e17..e73b4b68444 100644
+--- a/src/tools/ceph_dedup/ceph_dedup_tool.cc
++++ b/src/tools/ceph_dedup/ceph_dedup_tool.cc
+@@ -76,16 +76,16 @@ struct EstimateResult {
+     //f->dump_unsigned("dedup_bytes", dedup_bytes);
+     //f->dump_unsigned("original_bytes", total_bytes);
+     f->dump_float("dedup_bytes_ratio",
+-		  (double)dedup_bytes / (double)total_bytes);
++		  total_bytes ? (double)dedup_bytes / (double)total_bytes : 0);
+     f->dump_float("dedup_objects_ratio",
+-		  (double)dedup_objects / (double)total_objects);
++		  total_objects ? (double)dedup_objects / (double)total_objects : 0);
+ 
+-    uint64_t avg = total_bytes / dedup_objects;
++    uint64_t avg = dedup_objects ? total_bytes / dedup_objects : 0;
+     uint64_t sqsum = 0;
+     for (auto& j : chunk_statistics) {
+       sqsum += (avg - j.second.second) * (avg - j.second.second);
+     }
+-    uint64_t stddev = sqrt(sqsum / dedup_objects);
++    uint64_t stddev = dedup_objects ? sqrt(sqsum / dedup_objects) : 0;
+     f->dump_unsigned("chunk_size_average", avg);
+     f->dump_unsigned("chunk_size_stddev", stddev);
+   }
+-- 
+2.54.0
+

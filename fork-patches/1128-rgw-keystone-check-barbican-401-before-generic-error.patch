@@ -1,0 +1,46 @@
+From 25489f0cb07082746000c852dbcbd03ad32ed9b1 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Mon, 29 Jun 2026 19:42:43 -0700
+Subject: [PATCH 12/13] rgw/keystone: check barbican 401 before generic error
+
+get_keystone_barbican_token() checked for HTTP 401 only after returning
+on any ret < 0, but process() maps 401 to a negative errno, so the 401
+branch was unreachable dead code and the more specific -EACCES was never
+returned. Reorder the checks to match issue_admin_token_request(), which
+inspects the HTTP status before the generic error path.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/rgw/rgw_keystone.cc | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/src/rgw/rgw_keystone.cc b/src/rgw/rgw_keystone.cc
+index f37ef105c6b..e4344ef12b9 100644
+--- a/src/rgw/rgw_keystone.cc
++++ b/src/rgw/rgw_keystone.cc
+@@ -225,10 +225,6 @@ int Service::get_keystone_barbican_token(const DoutPrefixProvider *dpp,
+ 
+   ldpp_dout(dpp, 20) << "Requesting secret from barbican url=" << token_url << dendl;
+   int ret = token_req.process(dpp, y);
+-  if (ret < 0) {
+-    ldpp_dout(dpp, 20) << "Barbican process error:" << token_bl.c_str() << dendl;
+-    return ret;
+-  }
+ 
+   /* Detect rejection earlier than during the token parsing step. */
+   if (token_req.get_http_status() ==
+@@ -236,6 +232,11 @@ int Service::get_keystone_barbican_token(const DoutPrefixProvider *dpp,
+     return -EACCES;
+   }
+ 
++  if (ret < 0) {
++    ldpp_dout(dpp, 20) << "Barbican process error:" << token_bl.c_str() << dendl;
++    return ret;
++  }
++
+   ret = t.parse(dpp, token_req.get_subject_token(), token_bl);
+   if (ret != 0) {
+     return -EINVAL;
+-- 
+2.55.0
+

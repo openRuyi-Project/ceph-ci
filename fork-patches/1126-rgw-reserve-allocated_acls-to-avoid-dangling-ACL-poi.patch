@@ -1,0 +1,37 @@
+From 59364985ce2dd43c5e5eca00940af082492b9049 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Mon, 29 Jun 2026 19:41:39 -0700
+Subject: [PATCH 10/13] rgw: reserve allocated_acls to avoid dangling ACL
+ pointers in SLO
+
+handle_slo_manifest() stores pointers to elements of the allocated_acls
+vector into both the policies map and slo_parts. Without a reserve, a
+second distinct external bucket triggers a reallocation that invalidates
+the pointer captured for the first one, leaving slo_parts referencing
+freed memory (use-after-free) when the parts are later iterated.
+
+Reserve capacity up front so element addresses stay stable.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/rgw/rgw_op.cc | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/rgw/rgw_op.cc b/src/rgw/rgw_op.cc
+index bfcb0ea6df1..e27d59cec0d 100644
+--- a/src/rgw/rgw_op.cc
++++ b/src/rgw/rgw_op.cc
+@@ -2454,6 +2454,10 @@ int RGWGetObj::handle_slo_manifest(bufferlist& bl, optional_yield y)
+   ldpp_dout(this, 2) << "RGWGetObj::handle_slo_manifest()" << dendl;
+ 
+   vector<RGWAccessControlPolicy> allocated_acls;
++  /* Pointers to elements of allocated_acls are stored in `policies` and
++   * `slo_parts` below, so reserve up front: a reallocation would otherwise
++   * invalidate previously captured pointers and leave them dangling. */
++  allocated_acls.reserve(slo_info.entries.size());
+   map<string, pair<RGWAccessControlPolicy *, boost::optional<Policy>>> policies;
+   map<string, std::unique_ptr<rgw::sal::Bucket>> buckets;
+   const std::string& auth_tenant = s->auth.identity->get_tenant();
+-- 
+2.55.0
+

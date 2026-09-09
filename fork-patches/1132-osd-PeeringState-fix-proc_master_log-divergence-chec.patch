@@ -1,0 +1,66 @@
+From 5290a609128b25e94fb55ccdaae1e7d1d622b651 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Sun, 12 Jul 2026 23:39:52 -0700
+Subject: [PATCH] osd/PeeringState: fix proc_master_log divergence check vs
+ olog.head
+
+`auto op = olog.log.end()` never moved, so `op->version` dereferenced
+the end iterator (UB since 5f687c4a182b). It also rolled pwlc back to
+the log tail when olog.log.back() < p->version but p->version <=
+olog.head (log gaps after a PG split, or apply_pwlc advancing
+olog.head past the last entry), misjudging acked partial writes as
+divergent; commit 1b44fd9991f5 made this the rollback branch.
+
+Use olog.log.empty()/back() and accept p->version <= olog.head like
+the empty-log branch.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/osd/PeeringState.cc | 27 +++++++++++++++------------
+ 1 file changed, 15 insertions(+), 12 deletions(-)
+
+diff --git a/src/osd/PeeringState.cc b/src/osd/PeeringState.cc
+index c3ed6be81076..b47332d3628a 100644
+--- a/src/osd/PeeringState.cc
++++ b/src/osd/PeeringState.cc
+@@ -3423,25 +3423,28 @@ void PeeringState::proc_master_log(
+       // of p->version. So long as there are no entries in olog between
+       // p->version and olog.head we can still try to wind forward
+       // partially written entries
+-      auto op = olog.log.end();
+-      if (op == olog.log.begin()) {
+-	// Other log is emtpy
++      if (olog.log.empty()) {
+ 	if (p->version <= olog.head) {
+ 	  consider_adjusting_pwlc(p->version);
+ 	  ++p;
+ 	} else {
+ 	  consider_adjusting_pwlc(pg_log.get_tail());
+ 	}
+-      } else if (op->version == p->version) {
+-	// Normal case - both logs have this entry
+-	consider_adjusting_pwlc(p->version);
+-	++p;
+-      } else if (op->version < p->version) {
+-	// Last entry in other log is before this entry
+-	consider_adjusting_pwlc(pg_log.get_tail());
+       } else {
+-	// Other log is ahead of the primary log - give up
+-	p = pg_log.get_log().log.end();
++	const eversion_t olast = olog.log.back().version;
++	if (olast == p->version ||
++	    (olast < p->version && p->version <= olog.head)) {
++	  // Normal case - both logs have entry p->version, or olog has
++	  // no entries between p->version and olog.head
++	  consider_adjusting_pwlc(p->version);
++	  ++p;
++	} else if (olast < p->version) {
++	  // Divergence is before the oldest entry both logs share
++	  consider_adjusting_pwlc(pg_log.get_tail());
++	} else {
++	  // Other log is ahead of the primary log - give up
++	  p = pg_log.get_log().log.end();
++	}
+       }
+     }
+     // See if we can wind forward partially written entries

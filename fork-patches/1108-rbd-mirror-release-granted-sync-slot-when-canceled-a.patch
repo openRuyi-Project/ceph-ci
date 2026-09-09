@@ -1,0 +1,53 @@
+From 1d591696b9294f51c9c1f2b4ccd8c078d32ca81b Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Mon, 6 Jul 2026 19:04:52 -0700
+Subject: [PATCH 06/13] rbd-mirror: release granted sync slot when canceled
+ after grant
+
+If ImageSync is canceled between InstanceWatcher granting the sync request
+and handle_notify_sync_request() running, the slot is already reserved but
+handle_notify_sync_request() turns r into -ECANCELED and calls
+CancelableRequest::finish(), bypassing the ImageSync::finish() that
+releases the slot. The leaked entry then trips the m_inflight_sync_reqs
+asserts on the next sync or on shutdown.
+
+Distinguish "canceled after grant" (r was 0) from "already canceled by
+InstanceWatcher" (r already -ECANCELED), and release the slot via the
+virtual finish() only in the former.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/tools/rbd_mirror/ImageSync.cc | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/src/tools/rbd_mirror/ImageSync.cc b/src/tools/rbd_mirror/ImageSync.cc
+index 7ca8b2fa270..7e83c9a1486 100644
+--- a/src/tools/rbd_mirror/ImageSync.cc
++++ b/src/tools/rbd_mirror/ImageSync.cc
+@@ -129,12 +129,22 @@ void ImageSync<I>::handle_notify_sync_request(int r) {
+   dout(10) << ": r=" << r << dendl;
+ 
+   m_lock.lock();
+-  if (r == 0 && m_canceled) {
++  // the sync request may have been granted before cancel() was observed;
++  // in that case the slot must be released via notify_sync_complete()
++  bool canceled_after_grant = (r == 0 && m_canceled);
++  if (canceled_after_grant) {
+     r = -ECANCELED;
+   }
+   m_lock.unlock();
+ 
++  if (canceled_after_grant) {
++    // release the granted slot through the ImageSync::finish() override
++    finish(r);
++    return;
++  }
++
+   if (r < 0) {
++    // already released by InstanceWatcher on the cancel path
+     CancelableRequest::finish(r);
+     return;
+   }
+-- 
+2.55.0
+

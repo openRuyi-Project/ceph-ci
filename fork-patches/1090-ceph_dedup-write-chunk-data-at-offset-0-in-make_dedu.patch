@@ -1,0 +1,32 @@
+From 942e5767997e9472df6c37cb16d0a9caf68aeb93 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Wed, 1 Jul 2026 02:59:15 -0700
+Subject: [PATCH 06/10] ceph_dedup: write chunk data at offset 0 in
+ make_dedup_object
+
+make_dedup_object() wrote the chunk payload at `offset` in the
+chunk object but then referenced it via set_chunk() with a target
+offset of 0, so the dedup manifest pointed at empty/zero data.
+Write the payload at offset 0 to match the set_chunk() reference.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/tools/ceph_dedup/ceph_dedup_tool.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/tools/ceph_dedup/ceph_dedup_tool.cc b/src/tools/ceph_dedup/ceph_dedup_tool.cc
+index e73b4b68444..eeb27b9afbd 100644
+--- a/src/tools/ceph_dedup/ceph_dedup_tool.cc
++++ b/src/tools/ceph_dedup/ceph_dedup_tool.cc
+@@ -955,7 +955,7 @@ int make_dedup_object(const po::variables_map &opts)
+         return {};
+       }
+     }();
+-    ret = chunk_io_ctx.write(chunk_object, bl, length, offset);
++    ret = chunk_io_ctx.write(chunk_object, bl, length, 0);
+     if (ret < 0) {
+       std::cerr << " writing object in chunk pool fails : " << cpp_strerror(ret) << std::endl;
+       goto out;
+-- 
+2.54.0
+

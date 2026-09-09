@@ -1,0 +1,38 @@
+From b093a4f84a0160bb95b65a84ac353bac1b79e7c4 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Mon, 6 Jul 2026 19:10:08 -0700
+Subject: [PATCH 11/13] rbd-mirror: guard m_image_map init with m_lock
+
+handle_init_image_map() assigns m_image_map without m_lock, while
+handle_instances_added/removed() and handle_update() read it under m_lock.
+During leader acquisition the instance is already leader, so PoolReplayer
+can dispatch instance updates concurrently with this init -- a data race
+on the unique_ptr. Take m_lock around the assignment, as every other
+access does.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/tools/rbd_mirror/NamespaceReplayer.cc | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/tools/rbd_mirror/NamespaceReplayer.cc b/src/tools/rbd_mirror/NamespaceReplayer.cc
+index e29ca00fcff..c829fc0410d 100644
+--- a/src/tools/rbd_mirror/NamespaceReplayer.cc
++++ b/src/tools/rbd_mirror/NamespaceReplayer.cc
+@@ -611,8 +611,11 @@ void NamespaceReplayer<I>::handle_init_image_map(int r, ImageMap<I> *image_map,
+     return;
+   }
+ 
+-  ceph_assert(!m_image_map);
+-  m_image_map.reset(image_map);
++  {
++    std::lock_guard locker{m_lock};
++    ceph_assert(!m_image_map);
++    m_image_map.reset(image_map);
++  }
+ 
+   init_local_pool_watcher(on_finish);
+ }
+-- 
+2.55.0
+

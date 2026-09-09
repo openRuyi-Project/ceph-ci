@@ -1,0 +1,30 @@
+From daf8ff40c0a797b68d0bc1197948e9c0fda1d3cd Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Wed, 1 Jul 2026 02:59:15 -0700
+Subject: [PATCH 08/10] cephfs-data-scan: increment progress in scan_frags
+
+scan_frags() updated the total and displayed progress but never
+called progress_tracker->increment(), unlike the other scan passes,
+so the progress indicator stayed at 0%. Add the missing
+increment().
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/tools/cephfs/DataScan.cc | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/tools/cephfs/DataScan.cc b/src/tools/cephfs/DataScan.cc
+index 52965596479..aca4b27f434 100644
+--- a/src/tools/cephfs/DataScan.cc
++++ b/src/tools/cephfs/DataScan.cc
+@@ -1876,6 +1876,7 @@ int DataScan::scan_frags()
+       }
+     }
+ 
++    progress_tracker->increment();
+     uint64_t _total_objects = get_pool_objects({&metadata_io});
+     if (_total_objects > total_objects) {
+       progress_tracker->set_total(_total_objects);
+-- 
+2.54.0
+

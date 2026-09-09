@@ -1,0 +1,76 @@
+From 8a735ca35a748a353f8a7ca488f5a5e8a76aaf96 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Wed, 1 Jul 2026 02:59:15 -0700
+Subject: [PATCH 01/10] mgr/DaemonServer: fix order-dependent ok-to-stop false
+ negative
+
+In _check_offlines_pgs the per-PG `found` flag was reassigned on
+every iteration over the acting / avail_no_missing set, so after
+the loop it only reflected the last OSD checked. When an OSD being
+stopped was not the last entry of the set, `found` ended up false
+and the PG was skipped by the `if (!found) continue` guard, so its
+possible drop below min_size was never evaluated. As a result
+`osd ok-to-stop` / `ok-to-upgrade` could report an operation that
+takes PGs offline as safe.
+
+Accumulate the flag with a per-iteration local instead of
+overwriting it, so any acting OSD in the stop set marks the PG.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/mgr/DaemonServer.cc | 20 ++++++++++++--------
+ 1 file changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/src/mgr/DaemonServer.cc b/src/mgr/DaemonServer.cc
+index a7ddac0868d..0643287ccdb 100644
+--- a/src/mgr/DaemonServer.cc
++++ b/src/mgr/DaemonServer.cc
+@@ -1063,16 +1063,18 @@ void DaemonServer::_check_offlines_pgs(
+     }
+     if (q.second.state & PG_STATE_DEGRADED) {
+       for (auto& anm : q.second.avail_no_missing) {
+-        std::visit([anm, &found](auto& container) {
++        bool in_osds = false;
++        std::visit([anm, &in_osds](auto& container) {
+           using T = std::decay_t<decltype(container)>;
+           if constexpr (std::is_same_v<T, std::set<int>>) {
+-            found = container.count(anm.osd);
++            in_osds = container.count(anm.osd);
+           } else if constexpr (std::is_same_v<T, std::vector<int>>) {
+             auto it = std::find(container.begin(), container.end(), anm.osd);
+-            found = (it != container.end());
++            in_osds = (it != container.end());
+           }
+         }, osds);
+-        if (found) {
++        if (in_osds) {
++          found = true;
+           continue;
+         }
+ 	if (anm.osd != CRUSH_ITEM_NONE) {
+@@ -1081,16 +1083,18 @@ void DaemonServer::_check_offlines_pgs(
+       }
+     } else {
+       for (auto& a : q.second.acting) {
+-        std::visit([a, &found](auto& container) {
++        bool in_osds = false;
++        std::visit([a, &in_osds](auto& container) {
+           using T = std::decay_t<decltype(container)>;
+           if constexpr (std::is_same_v<T, std::set<int>>) {
+-            found = container.count(a);
++            in_osds = container.count(a);
+           } else if constexpr (std::is_same_v<T, std::vector<int>>) {
+             auto it = std::find(container.begin(), container.end(), a);
+-            found = (it != container.end());
++            in_osds = (it != container.end());
+           }
+         }, osds);
+-        if (found) {
++        if (in_osds) {
++          found = true;
+           continue;
+         }
+ 	if (a != CRUSH_ITEM_NONE) {
+-- 
+2.54.0
+

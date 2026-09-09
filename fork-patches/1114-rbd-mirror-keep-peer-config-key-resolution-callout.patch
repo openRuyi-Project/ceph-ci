@@ -1,0 +1,50 @@
+From a1dacf765c25a9bf20837d77ae9653f7c7d40da4 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Mon, 6 Jul 2026 19:07:57 -0700
+Subject: [PATCH 12/13] rbd-mirror: keep peer config-key resolution callout
+
+read_pool_peers() cleared the pool callout unconditionally after resolving
+peer config keys, removing the WARNING callout that
+resolve_peer_site_config_keys() had just registered on a config-key
+failure -- so it never showed in "ceph service status". Clear the stale
+callout before resolving instead of after.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/tools/rbd_mirror/ClusterWatcher.cc | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/src/tools/rbd_mirror/ClusterWatcher.cc b/src/tools/rbd_mirror/ClusterWatcher.cc
+index aae7b84670d..8745cee1b17 100644
+--- a/src/tools/rbd_mirror/ClusterWatcher.cc
++++ b/src/tools/rbd_mirror/ClusterWatcher.cc
+@@ -160,6 +160,14 @@ void ClusterWatcher::read_pool_peers(PoolPeers *pool_peers)
+       }
+     }
+ 
++    // clear any stale callout from a previous refresh before
++    // re-evaluating the peer configs; resolve_peer_site_config_keys()
++    // registers a fresh callout of its own on failure
++    if (m_service_pools[pool_id] != service_daemon::CALLOUT_ID_NONE) {
++      m_service_daemon->remove_callout(pool_id, m_service_pools[pool_id]);
++      m_service_pools[pool_id] = service_daemon::CALLOUT_ID_NONE;
++    }
++
+     for (auto& peer : peers) {
+       r = resolve_peer_site_config_keys(pool_id, pool_name, &peer);
+       if (r < 0) {
+@@ -167,11 +175,6 @@ void ClusterWatcher::read_pool_peers(PoolPeers *pool_peers)
+       }
+     }
+ 
+-    if (m_service_pools[pool_id] != service_daemon::CALLOUT_ID_NONE) {
+-      m_service_daemon->remove_callout(pool_id, m_service_pools[pool_id]);
+-      m_service_pools[pool_id] = service_daemon::CALLOUT_ID_NONE;
+-    }
+-
+     pool_peers->emplace(pool_id, Peers{peers.begin(), peers.end()});
+   }
+ 
+-- 
+2.55.0
+

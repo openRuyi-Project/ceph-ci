@@ -1,0 +1,42 @@
+From 5a9b01e8b866b6f670fe7f20addfce7917e79c52 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Fri, 17 Jul 2026 07:04:53 -0700
+Subject: [PATCH] test/common: run unittest_throttle serially
+
+The BackoffThrottle tests assert the time-averaged occupancy the
+throttle settles at, e.g. (35, 45) for undersaturated with
+low_threshhold 0.4 of max 100. The equilibrium near the threshold only
+forms when the getter threads can outrun the putters' drain rate, which
+has implicitly assumed an unloaded machine since the tests were
+introduced in 9f4cba31d7f ("Throttle: add BackoffThrottle unit tests").
+On a saturated ctest run the getters get preempted, the arrival rate
+drops below the drain rate even with no backoff delay injected, and the
+occupancy sags below the asserted band (observed 26.6 < 35 repeatedly
+under a full -j63 make check), failing the test although the throttle
+behaves correctly.
+
+Mark the test RUN_SERIAL so ctest runs it alone, restoring the
+premise. It takes ~20s, a negligible serial window for the suite.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/test/common/CMakeLists.txt | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/test/common/CMakeLists.txt b/src/test/common/CMakeLists.txt
+index 0765f0c2efd..934ae802834 100644
+--- a/src/test/common/CMakeLists.txt
++++ b/src/test/common/CMakeLists.txt
+@@ -166,7 +166,8 @@ add_executable(unittest_throttle
+   $<TARGET_OBJECTS:unit-main>
+   )
+ add_ceph_unittest(unittest_throttle PARALLEL)
+-target_link_libraries(unittest_throttle global) 
++set_property(TEST unittest_throttle PROPERTY RUN_SERIAL TRUE)
++target_link_libraries(unittest_throttle global)
+ 
+ # unittest_lru
+ add_executable(unittest_lru
+-- 
+2.55.0
+

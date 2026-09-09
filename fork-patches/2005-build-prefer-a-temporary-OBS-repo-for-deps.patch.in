@@ -1,0 +1,37 @@
+From fbcfd98f75da1df7f34249d1b77022ef1880e558 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Fri, 12 Jun 2026 00:00:00 +0800
+Subject: [PATCH] build: prefer a temporary OBS repo for deps
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/script/buildcontainer-setup.sh | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/src/script/buildcontainer-setup.sh b/src/script/buildcontainer-setup.sh
+index 930131f52af..464dad578f2 100644
+--- a/src/script/buildcontainer-setup.sh
++++ b/src/script/buildcontainer-setup.sh
+@@ -43,6 +43,20 @@ case "${CEPH_BASE_BRANCH}~${DISTRO_KIND}" in
+     ;;
+     # openRuyi's minimal image lacks tar/gzip needed to unpack build tarballs
+     *~*openruyi*)
++        # Prefer the temporary OBS project for any package it
++        # publishes (priority=1 beats the stock repos' default 99); packages
++        # it does not carry still come from the image's stock openRuyi repos.
++        # OBS-published RPMs are unsigned (gpgcheck=0), and an unpublished or
++        # unreachable project must not break CI (skip_if_unavailable=1).
++        cat > /etc/yum.repos.d/ceph-ci-temp-obs.repo <<'REPO'
++[ceph-ci-temp-obs]
++name=@TEMP_OBS_PROJECT@ (riscv64)
++baseurl=@TEMP_OBS_REPO_URL@
++enabled=1
++gpgcheck=0
++priority=1
++skip_if_unavailable=1
++REPO
+         dnf install -y tar gzip /usr/bin/{rpmbuild,wget,curl}
+         install_container_deps
+         dnf_clean
+-- 
+2.55.0

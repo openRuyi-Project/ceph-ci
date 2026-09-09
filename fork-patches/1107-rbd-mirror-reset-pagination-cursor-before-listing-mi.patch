@@ -1,0 +1,37 @@
+From 135aae1488540e1c618444bf9f9fa0b44a1c0d21 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Mon, 6 Jul 2026 19:04:28 -0700
+Subject: [PATCH 05/13] rbd-mirror: reset pagination cursor before listing
+ mirror images
+
+image_map::LoadRequest reuses m_start_after for two listings: the on-disk
+image map (keyed by global image id) and the mirror image list (keyed by
+image id). When the image map spans multiple pages, the leftover global
+id is passed as the mirror-list start key, skipping every mirror image
+sorting at or before it -- so cleanup_image_map() drops the still-valid
+mapping.
+
+Reset m_start_after before the mirror image list, as already done between
+mirror-image pages.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/tools/rbd_mirror/image_map/LoadRequest.cc | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/tools/rbd_mirror/image_map/LoadRequest.cc b/src/tools/rbd_mirror/image_map/LoadRequest.cc
+index 693a92f123f..b91f5995c75 100644
+--- a/src/tools/rbd_mirror/image_map/LoadRequest.cc
++++ b/src/tools/rbd_mirror/image_map/LoadRequest.cc
+@@ -82,6 +82,8 @@ void LoadRequest<I>::handle_image_map_list(int r) {
+     return;
+   }
+ 
++  // switching to a different key space; reset the pagination cursor
++  m_start_after = "";
+   mirror_image_list();
+ }
+ 
+-- 
+2.55.0
+

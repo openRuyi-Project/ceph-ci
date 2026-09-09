@@ -1,0 +1,33 @@
+From dfcb3c2c00540cdf9ad9d70c1d079efbe7d91299 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Wed, 1 Jul 2026 02:59:15 -0700
+Subject: [PATCH 07/10] ceph_dedup: validate sampling-ratio range in daemon
+
+The daemon defaults sampling_ratio to -1 and never validated it. A
+negative ratio flows into sample_object() as a negative double, and
+the following resize() converts it to a huge size_t, aborting with
+bad_alloc. Reject values outside [0, 100] with a clear error.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/tools/ceph_dedup/ceph_dedup_daemon.cc | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/tools/ceph_dedup/ceph_dedup_daemon.cc b/src/tools/ceph_dedup/ceph_dedup_daemon.cc
+index c68cf19fa8b..dfd94c2e780 100644
+--- a/src/tools/ceph_dedup/ceph_dedup_daemon.cc
++++ b/src/tools/ceph_dedup/ceph_dedup_daemon.cc
+@@ -610,6 +610,10 @@ int run_crawling_daemon(const po::variables_map &opts)
+   if (opts.count("sampling-ratio")) {
+     sampling_ratio = opts["sampling-ratio"].as<int>();
+   }
++  if (sampling_ratio < 0 || sampling_ratio > 100) {
++    derr << "sampling-ratio must be in the range [0, 100]" << dendl;
++    return -EINVAL;
++  }
+   size_t chunk_size = 8192;
+   if (opts.count("chunk-size")) {
+     chunk_size = opts["chunk-size"].as<int>();
+-- 
+2.54.0
+

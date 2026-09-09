@@ -1,0 +1,34 @@
+From 3c176217203b5aa9ce8f0458005f183df2ac7d41 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Wed, 1 Jul 2026 02:59:15 -0700
+Subject: [PATCH 09/10] cephfs bench: reject a block-size of 0
+
+do_bench() only bounded block_size from above. With --block-size 0
+the per-block write computes to_write = 0, ceph_write() returns 0
+(not an error), `written` never advances and the writer threads
+spin forever, so the join() at the end hangs. Reject a zero block
+size.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/tools/cephfs/cephfs-tool.cc | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/tools/cephfs/cephfs-tool.cc b/src/tools/cephfs/cephfs-tool.cc
+index 9d38c88ada6..afb4c21dd50 100644
+--- a/src/tools/cephfs/cephfs-tool.cc
++++ b/src/tools/cephfs/cephfs-tool.cc
+@@ -464,6 +464,10 @@ bool check_and_report_errors(const std::atomic<bool>& stop_signal,
+ }
+ 
+ int do_bench(BenchConfig& config) {
++  if (config.block_size == 0) {
++    cerr << "Error: block-size must be greater than 0." << endl;
++    return 1;
++  }
+   if (config.block_size > std::numeric_limits<int>::max()) {
+     cerr << "Error: block-size cannot exceed 2GB due to API limitations." << endl;
+     return 1;
+-- 
+2.54.0
+

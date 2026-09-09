@@ -1,0 +1,8 @@
+# Local run products; the CI writes nothing into the repo itself.
+/__log/
+/logs/
+/notes/
+
+# Site-local drivers an operator may keep beside this repo rather than in it.
+/run-remote.sh
+/update-openruyi-image.sh

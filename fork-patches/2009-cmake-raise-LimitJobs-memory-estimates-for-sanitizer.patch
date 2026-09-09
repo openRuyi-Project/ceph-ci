@@ -1,0 +1,39 @@
+From 036823ad035ba72c15662f366527b0ed96c94879 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Sat, 12 Sep 2026 10:54:11 -0700
+Subject: [PATCH] cmake: raise LimitJobs memory estimates for sanitizer builds
+
+LimitJobs.cmake sizes the ninja compile and link pools from a fixed
+per-job memory estimate that was calibrated on x86 without sanitizers.
+Under ASan on riscv64 a compile job peaks around 6 GiB and a link of the
+static rgw or crimson stack around 8 GiB, so the pools it computes
+oversubscribe memory and the linker gets OOM-killed.
+
+Scale the estimates when WITH_ASAN, WITH_TSAN or WITH_UBSAN is set. The
+numbers come from one riscv64 host only; not for upstream until they are
+checked on x86.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ cmake/modules/LimitJobs.cmake | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/cmake/modules/LimitJobs.cmake b/cmake/modules/LimitJobs.cmake
+index 2dcad24a806..ddd3c47aafc 100644
+--- a/cmake/modules/LimitJobs.cmake
++++ b/cmake/modules/LimitJobs.cmake
+@@ -1,5 +1,11 @@
+ set(MAX_COMPILE_MEM 3500 CACHE INTERNAL "maximum memory used by each compiling job (in MiB)")
+ set(MAX_LINK_MEM 4500 CACHE INTERNAL "maximum memory used by each linking job (in MiB)")
++# Sanitizer instrumentation roughly doubles the object code and its debug info,
++# so the compiler and especially the linker need far more memory per job.
++if(WITH_ASAN OR WITH_TSAN OR WITH_UBSAN)
++  set(MAX_COMPILE_MEM 5000 CACHE INTERNAL "maximum memory used by each compiling job (in MiB)" FORCE)
++  set(MAX_LINK_MEM 9000 CACHE INTERNAL "maximum memory used by each linking job (in MiB)" FORCE)
++endif()
+ 
+ cmake_host_system_information(RESULT _num_cores QUERY NUMBER_OF_LOGICAL_CORES)
+ cmake_host_system_information(RESULT _total_mem QUERY TOTAL_PHYSICAL_MEMORY)
+-- 
+2.55.0
+

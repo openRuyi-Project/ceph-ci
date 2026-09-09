@@ -1,0 +1,98 @@
+From 6cb6464642110794862703bb024d1bef8b914893 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Mon, 6 Jul 2026 19:00:29 -0700
+Subject: [PATCH 1/2] rbd-mirror: fix self-deadlock in ImageDeleter on
+ blocklist
+
+enqueue_failed_delete()'s -EBLOCKLISTED branch held m_lock and then
+called complete_active_delete(), which re-locks the non-recursive
+m_lock, deadlocking the work queue thread.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/tools/rbd_mirror/ImageDeleter.cc | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/src/tools/rbd_mirror/ImageDeleter.cc b/src/tools/rbd_mirror/ImageDeleter.cc
+index 790c4119fb8d..be44b2012691 100644
+--- a/src/tools/rbd_mirror/ImageDeleter.cc
++++ b/src/tools/rbd_mirror/ImageDeleter.cc
+@@ -265,7 +265,6 @@ void ImageDeleter<I>::enqueue_failed_delete(DeleteInfoRef* delete_info,
+                                             double retry_delay) {
+   dout(20) << "info=" << *delete_info << ", r=" << error_code << dendl;
+   if (error_code == -EBLOCKLISTED) {
+-    std::lock_guard locker{m_lock};
+     derr << "blocklisted while deleting local image" << dendl;
+     complete_active_delete(delete_info, error_code);
+     return;
+
+From a8db6a0045d889f42f3d8028e08cec18bdf8ea57 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Mon, 10 Aug 2026 20:38:02 -0700
+Subject: [PATCH 2/2] rbd-mirror: avoid deadlock removing local journal
+ listener
+
+close_local_image() and handle_replay_flush_shut_down() call
+remove_listener() with m_lock held. remove_listener() waits for
+in-flight listener callbacks, which acquire m_lock, so a concurrent
+notification deadlocks the replayer.
+
+Defer the callbacks to the work queue, as RemoteJournalerListener
+already does.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ .../image_replayer/journal/Replayer.cc        | 26 ++++++++++++++++---
+ 1 file changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/src/tools/rbd_mirror/image_replayer/journal/Replayer.cc b/src/tools/rbd_mirror/image_replayer/journal/Replayer.cc
+index 428c494d6a54..4b668a1ada7c 100644
+--- a/src/tools/rbd_mirror/image_replayer/journal/Replayer.cc
++++ b/src/tools/rbd_mirror/image_replayer/journal/Replayer.cc
+@@ -25,6 +25,7 @@
+ #include "tools/rbd_mirror/image_replayer/journal/ReplayStatusFormatter.h"
+ #include "tools/rbd_mirror/image_replayer/journal/StateBuilder.h"
+ 
++#include <functional> // for std::function
+ #include <shared_mutex> // for std::shared_lock
+ 
+ #define dout_context g_ceph_context
+@@ -128,16 +129,35 @@ struct Replayer<I>::LocalJournalListener
+   LocalJournalListener(Replayer* replayer) : replayer(replayer) {
+   }
+ 
++  // notifications cannot take m_lock (remove_listener() waits for
++  // them) nor capture the listener (deleted right after removal)
++  void schedule_notification(std::function<void(Replayer*)>&& notification) {
++    auto replayer = this->replayer;
++    auto ctx = new C_TrackedOp(
++      replayer->m_in_flight_op_tracker,
++      new LambdaContext(
++        [replayer, notification=std::move(notification)](int r) {
++          notification(replayer);
++        }));
++    replayer->m_threads->work_queue->queue(ctx, 0);
++  }
++
+   void handle_close() override {
+-    replayer->handle_replay_complete(0, "");
++    schedule_notification([](Replayer* replayer) {
++        replayer->handle_replay_complete(0, "");
++      });
+   }
+ 
+   void handle_promoted() override {
+-    replayer->handle_replay_complete(0, "force promoted");
++    schedule_notification([](Replayer* replayer) {
++        replayer->handle_replay_complete(0, "force promoted");
++      });
+   }
+ 
+   void handle_resync() override {
+-    replayer->handle_resync_image();
++    schedule_notification([](Replayer* replayer) {
++        replayer->handle_resync_image();
++      });
+   }
+ };
+ 
