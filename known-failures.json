@@ -1,0 +1,49 @@
+{
+    "_comment": [
+        "Known ctest outcomes on riscv64/openRuyi. All three drivers read this file via",
+        "ci_ctest_makeopts in scripts/lib/common.sh, which turns it into ctest options.",
+        "Each entry tags a ctest name as 'exclude' or 'flake':",
+        "  exclude - deterministically wrong for a non-defect reason (version-sensitive",
+        "            goldens, etc). Dropped via ctest -E. openRuyi's spec %check -E's the",
+        "            same ones.",
+        "  flake   - fails non-deterministically (timing/resource races under -j, or a",
+        "            transient network fault), not from a code bug. NOT excluded; the run",
+        "            uses ctest --repeat until-pass so a retry clears them while a real",
+        "            regression still fails. Any flake entry turns --repeat on for the",
+        "            whole ctest run, not just that test.",
+        "Real code bugs are NOT listed here - they are carried as fork-patches (see README).",
+        "'test' is matched as a ctest-name regex (anchored ^...$ by the script)."
+    ],
+    "failures": [
+        {
+            "test": "unittest_bluefs",
+            "type": "exclude",
+            "reason": "todo",
+            "ref": "openRuyi spec %check -E excludes it too"
+        },
+        {
+            "test": "run-tox-promql-query-test",
+            "type": "exclude",
+            "reason": "grafana panel goldens drift with the prometheus version; not a defect",
+            "ref": "openRuyi spec %check -E excludes it too"
+        },
+        {
+            "test": "run-promtool-unittests",
+            "type": "exclude",
+            "reason": "alert-rules golden (tests_alerts/test_alerts.yml) drifts with the prometheus version; not a defect",
+            "ref": "openRuyi spec %check -E excludes it too"
+        },
+        {
+            "test": "run-tox-alerts-lint",
+            "type": "exclude",
+            "reason": "promtool packaged but not baked into the build image yet; `promtool check rules` fails with ENOENT",
+            "ref": "re-enable once promtool is baked into the build image"
+        },
+        {
+            "test": "jsonnet-bundler-build",
+            "type": "flake",
+            "reason": "jsonnet-bundler-build.sh git-clones github.com/jsonnet-bundler/jsonnet-bundler at test time with no retry; a proxy/github hiccup fails the clone and takes its dependent run-tox-jsonnet-check down as Not Run",
+            "ref": "only ctest still reaching the network during %check"
+        }
+    ]
+}
