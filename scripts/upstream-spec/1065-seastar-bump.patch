@@ -1,0 +1,1043 @@
+From f4de50d5af0afcdb6123a35a50332a9160132838 Mon Sep 17 00:00:00 2001
+From: Kefu Chai <k.chai@proxmox.com>
+Date: Fri, 26 Jun 2026 15:56:35 +0800
+Subject: [PATCH 1/3] crimson: bump seastar submodule and adapt to its new
+ future API
+
+Update src/seastar to scylladb/seastar master with the ceph patches reapplied,
+and adapt crimson to the future API changes the bump brings in:
+
+  - interruptible_future.h: seastar split its single ready_future_marker into
+    set_ready_future_marker and set_from_tuple_ready_future_marker; route
+    futurize::from_tuple through the matching markers.
+  - thread_pool.h: future_state::set() is now templated and get_value() is
+    ref-qualified; pass seastar::internal::monostate{} for the void case and
+    move the state before reading its value.
+
+These crimson changes need the new seastar, so they share one commit with the
+submodule bump. The build stays at Seastar_API_LEVEL 6 here; the level is
+raised in the following commit.
+
+Signed-off-by: Kefu Chai <k.chai@proxmox.com>
+---
+ src/crimson/common/interruptible_future.h | 8 ++++----
+ src/crimson/os/alienstore/thread_pool.h   | 4 ++--
+ src/seastar                               | 2 +-
+ 3 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/src/crimson/common/interruptible_future.h b/src/crimson/common/interruptible_future.h
+index 88859d08a7695..155da05d4ac3c 100644
+--- a/src/crimson/common/interruptible_future.h
++++ b/src/crimson/common/interruptible_future.h
+@@ -1638,16 +1638,16 @@ struct futurize<::crimson::interruptible::interruptible_future_detail<
+   using tuple_type = typename type::tuple_type;
+ 
+   static type from_tuple(tuple_type&& value) {
+-    return type(ready_future_marker(), std::move(value));
++    return type(set_from_tuple_ready_future_marker(), std::move(value));
+   }
+   static type from_tuple(const tuple_type& value) {
+-    return type(ready_future_marker(), value);
++    return type(set_from_tuple_ready_future_marker(), value);
+   }
+   static type from_tuple(value_type&& value) {
+-    return type(ready_future_marker(), std::move(value));
++    return type(set_ready_future_marker(), std::move(value));
+   }
+   static type from_tuple(const value_type& value) {
+-    return type(ready_future_marker(), value);
++    return type(set_ready_future_marker(), value);
+   }
+ 
+   template <typename Func, typename... FuncArgs>
+diff --git a/src/crimson/os/alienstore/thread_pool.h b/src/crimson/os/alienstore/thread_pool.h
+index 6a6ec29e7ad73..0a5c9bf0b281e 100644
+--- a/src/crimson/os/alienstore/thread_pool.h
++++ b/src/crimson/os/alienstore/thread_pool.h
+@@ -44,7 +44,7 @@ struct Task final : WorkItem {
+     try {
+       if constexpr (std::is_void_v<T>) {
+         func();
+-        state.set();
++        state.set(seastar::internal::monostate{});
+       } else {
+         state.set(func());
+       }
+@@ -58,7 +58,7 @@ struct Task final : WorkItem {
+       if (state.failed()) {
+         return futurator_t::make_exception_future(state.get_exception());
+       } else {
+-        return futurator_t::from_tuple(state.get_value());
++        return futurator_t::from_tuple(std::move(state).get_value());
+       }
+     });
+   }
+diff --git a/src/seastar b/src/seastar
+index 15b1ca1bec7e1..cced0236ee7cb 160000
+--- a/src/seastar
++++ b/src/seastar
+@@ -1 +1 @@
+-Subproject commit 15b1ca1bec7e148df262343f57b160d0248c736b
++Subproject commit cced0236ee7cb4e157b5a37fd9076d62c5be4f58
+
+From 70de348e9e25640c0754eefe7c21617b4a0e72b1 Mon Sep 17 00:00:00 2001
+From: Kefu Chai <k.chai@proxmox.com>
+Date: Fri, 26 Jun 2026 15:56:35 +0800
+Subject: [PATCH 2/3] crimson: use the seastar span sink API and build at API
+ level 10
+
+At SEASTAR_API_LEVEL >= 9 seastar dropped output_stream::write(net::packet) in
+favour of write(std::span<temporary_buffer<char>>). Convert Socket's writes to
+the span form, writing the packet's released fragments and keeping them alive
+across the write with do_with, then raise Seastar_API_LEVEL from 6 to 10 to
+match the updated seastar. The span write overloads are unconditional, so the
+Socket change is valid at every API level.
+
+Signed-off-by: Kefu Chai <k.chai@proxmox.com>
+---
+ src/CMakeLists.txt        |  2 +-
+ src/crimson/net/Socket.cc | 12 +++++++++---
+ 2 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 5fa9b0b06b457..75d3369d0bcb3 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -470,7 +470,7 @@ if(WITH_CRIMSON)
+       _find_package(${ARGV})
+     endif()
+   endmacro ()
+-  set(Seastar_API_LEVEL "6" CACHE STRING "" FORCE)
++  set(Seastar_API_LEVEL "10" CACHE STRING "" FORCE)
+   set(Seastar_IO_URING ${HAVE_LIBURING} CACHE BOOL "" FORCE)
+   set(Seastar_DEPRECATED_OSTREAM_FORMATTERS OFF CACHE BOOL "" FORCE)
+   if(Seastar_DPDK)
+diff --git a/src/crimson/net/Socket.cc b/src/crimson/net/Socket.cc
+index 97f25dcc42716..6a36b9ef427b6 100644
+--- a/src/crimson/net/Socket.cc
++++ b/src/crimson/net/Socket.cc
+@@ -5,8 +5,11 @@
+ 
+ #include <seastar/core/sleep.hh>
+ #include <seastar/core/when_all.hh>
++#include <seastar/core/do_with.hh>
+ #include <seastar/net/packet.hh>
+ 
++#include <span>
++
+ #include "crimson/common/config_proxy.h" // for local_conf()
+ #include "crimson/common/log.h"
+ #include "include/random.h" // for ceph::util::generate_random_number()
+@@ -191,7 +194,9 @@ Socket::write(bufferlist buf)
+     return inject_delay(
+     ).then([buf = std::move(buf), this]() mutable {
+       packet p(std::move(buf));
+-      return out.write(std::move(p));
++      return seastar::do_with(p.release(), [this](auto& frags) {
++        return out.write(std::span<seastar::temporary_buffer<char>>(frags));
++      });
+     });
+ #ifdef UNIT_TESTS_BUILT
+   }).then([this] {
+@@ -222,8 +227,9 @@ Socket::write_flush(bufferlist buf)
+     return inject_delay(
+     ).then([buf = std::move(buf), this]() mutable {
+       packet p(std::move(buf));
+-      return out.write(std::move(p)
+-      ).then([this] {
++      return seastar::do_with(p.release(), [this](auto& frags) {
++        return out.write(std::span<seastar::temporary_buffer<char>>(frags));
++      }).then([this] {
+         return out.flush();
+       });
+     });
+
+From f5eb58f60acc8b6f41b0603e83e45efb204afdaf Mon Sep 17 00:00:00 2001
+From: Kefu Chai <k.chai@proxmox.com>
+Date: Fri, 26 Jun 2026 19:35:15 +0800
+Subject: [PATCH 3/3] crimson: migrate off deprecated seastar::smp::count and
+ all_cpus()
+
+The updated seastar deprecates the global smp::count and smp::all_cpus() in
+favour of the per-instance smp::shard_count() and smp::all_shards(). Under the
+CI -Werror build these deprecation warnings are fatal.
+
+Replace the uses with the reactor-local free functions
+seastar::this_smp_shard_count() and seastar::this_smp_all_shards(), which read
+the current smp instance's shard count and shard-id range. crimson runs a
+single smp instance and every migrated site executes on a reactor thread (the
+alienstore worker threads do not touch these), so the behaviour is unchanged.
+
+Signed-off-by: Kefu Chai <k.chai@proxmox.com>
+---
+ src/crimson/common/config_proxy.h             |  2 +-
+ src/crimson/common/gated.h                    |  6 +-
+ src/crimson/common/smp_helpers.h              |  6 +-
+ src/crimson/os/alienstore/alien_store.cc      |  2 +-
+ src/crimson/os/alienstore/thread_pool.cc      |  4 +-
+ src/crimson/os/cyanstore/cyan_store.cc        | 16 ++---
+ src/crimson/os/futurized_store.h              |  2 +-
+ src/crimson/os/seastore/device.cc             |  2 +-
+ src/crimson/os/seastore/device.h              |  2 +-
+ .../random_block_manager/nvme_block_device.cc |  6 +-
+ .../random_block_manager/rbm_device.cc        | 10 ++--
+ src/crimson/os/seastore/seastore.cc           | 60 +++++++++----------
+ .../os/seastore/segment_manager/block.cc      | 24 ++++----
+ .../os/seastore/segment_manager/zbd.cc        | 18 +++---
+ src/crimson/osd/osd.cc                        |  6 +-
+ src/crimson/osd/osd_operation.cc              |  2 +-
+ src/crimson/osd/pg.cc                         |  2 +-
+ src/crimson/osd/pg_map.cc                     | 14 ++---
+ src/crimson/osd/pg_map.h                      |  6 +-
+ src/crimson/osd/pg_shard_manager.h            |  2 +-
+ src/crimson/tools/perf_crimson_msgr.cc        | 24 ++++----
+ src/crimson/tools/store_bench/store-bench.cc  |  2 +-
+ .../seastore/nvmedevice/test_nvmedevice.cc    |  2 +-
+ src/test/crimson/test_buffer.cc               |  4 +-
+ src/test/crimson/test_messenger.cc            |  2 +-
+ 25 files changed, 113 insertions(+), 113 deletions(-)
+
+diff --git a/src/crimson/common/config_proxy.h b/src/crimson/common/config_proxy.h
+index ee4595ad3e2fb..785789139dc9e 100644
+--- a/src/crimson/common/config_proxy.h
++++ b/src/crimson/common/config_proxy.h
+@@ -73,7 +73,7 @@ class ConfigProxy : public seastar::peering_sharded_service<ConfigProxy>
+         (*obs)->handle_conf_change(owner, keys);
+       }
+ 
+-      return seastar::parallel_for_each(std::views::iota(1u, seastar::smp::count),
++      return seastar::parallel_for_each(std::views::iota(1u, seastar::this_smp_shard_count()),
+                                         [&owner, new_values] (auto cpu) {
+         return owner.container().invoke_on(cpu,
+           [foreign_values = seastar::make_foreign(new_values)](ConfigProxy& proxy) mutable {
+diff --git a/src/crimson/common/gated.h b/src/crimson/common/gated.h
+index 1ec1d61877f96..b40a950490fa8 100644
+--- a/src/crimson/common/gated.h
++++ b/src/crimson/common/gated.h
+@@ -85,9 +85,9 @@ class Gated {
+ // across shards. ( https://tracker.ceph.com/issues/64332 )
+ class gate_per_shard {
+  public:
+-  gate_per_shard() : gates(seastar::smp::count) {
++  gate_per_shard() : gates(seastar::this_smp_shard_count()) {
+     std::vector<seastar::future<>> futures;
+-    for (unsigned shard = 0; shard < seastar::smp::count; ++shard) {
++    for (unsigned shard = 0; shard < seastar::this_smp_shard_count(); ++shard) {
+       futures.push_back(seastar::smp::submit_to(shard, [this, shard] {
+         gates[shard] = std::make_unique<Gated>();
+       }));
+@@ -121,7 +121,7 @@ class gate_per_shard {
+   }
+ 
+   seastar::future<> close_all() {
+-    ceph_assert(gates.size() == seastar::smp::count);
++    ceph_assert(gates.size() == seastar::this_smp_shard_count());
+     return seastar::parallel_for_each(gates.begin(), gates.end(), [] (std::unique_ptr<Gated>& gate_ptr) {
+       return seastar::smp::submit_to(gate_ptr->get_shard_id(), [gate = gate_ptr.get()] {
+         return gate->close();
+diff --git a/src/crimson/common/smp_helpers.h b/src/crimson/common/smp_helpers.h
+index 237267c150fd9..8cac858ab121e 100644
+--- a/src/crimson/common/smp_helpers.h
++++ b/src/crimson/common/smp_helpers.h
+@@ -66,7 +66,7 @@ auto proxy_method_on_core(
+  */
+ template <typename F>
+ auto invoke_on_all_seq(F f) -> decltype(seastar::futurize_invoke(f)) {
+-  for (auto core: seastar::smp::all_cpus()) {
++  for (auto core: seastar::this_smp_all_shards()) {
+       co_await crimson::submit_to(core, [&f] { return seastar::futurize_invoke(f);});
+   }
+ }
+@@ -96,8 +96,8 @@ class smp_crosscore_ordering_t {
+     : out_seqs(0) { }
+ 
+   smp_crosscore_ordering_t() requires (!IS_ONE)
+-    : out_seqs(seastar::smp::count, 0),
+-      in_controls(seastar::smp::count) {}
++    : out_seqs(seastar::this_smp_shard_count(), 0),
++      in_controls(seastar::this_smp_shard_count()) {}
+ 
+   ~smp_crosscore_ordering_t() = default;
+ 
+diff --git a/src/crimson/os/alienstore/alien_store.cc b/src/crimson/os/alienstore/alien_store.cc
+index ad565eff8da50..c31b8760975f8 100644
+--- a/src/crimson/os/alienstore/alien_store.cc
++++ b/src/crimson/os/alienstore/alien_store.cc
+@@ -120,7 +120,7 @@ seastar::future<uint32_t> AlienStore::start()
+     get_conf<uint64_t>("crimson_bluestore_num_threads");
+   tp = std::make_unique<crimson::os::ThreadPool>(num_threads, 128, alien_thread_cpu_cores);
+   return tp->start().then([]() {
+-    return seastar::make_ready_future<uint32_t>(seastar::smp::count);
++    return seastar::make_ready_future<uint32_t>(seastar::this_smp_shard_count());
+   });
+ }
+ 
+diff --git a/src/crimson/os/alienstore/thread_pool.cc b/src/crimson/os/alienstore/thread_pool.cc
+index 1898466fdcce0..4bf0f4aa77090 100644
+--- a/src/crimson/os/alienstore/thread_pool.cc
++++ b/src/crimson/os/alienstore/thread_pool.cc
+@@ -18,7 +18,7 @@ ThreadPool::ThreadPool(size_t n_threads,
+                        size_t queue_sz,
+                        const std::optional<seastar::resource::cpuset>& cpus)
+   : n_threads(n_threads),
+-    queue_size{round_up_to(queue_sz, seastar::smp::count)},
++    queue_size{round_up_to(queue_sz, seastar::this_smp_shard_count())},
+     pending_queues(n_threads)
+ {
+   auto queue_max_wait = std::chrono::seconds(local_conf()->threadpool_empty_queue_max_wait);
+@@ -82,7 +82,7 @@ void ThreadPool::loop(std::chrono::milliseconds queue_max_wait, size_t shard)
+ 
+ seastar::future<> ThreadPool::start()
+ {
+-  auto slots_per_shard = queue_size / seastar::smp::count;
++  auto slots_per_shard = queue_size / seastar::this_smp_shard_count();
+   return submit_queue.start(slots_per_shard);
+ }
+ 
+diff --git a/src/crimson/os/cyanstore/cyan_store.cc b/src/crimson/os/cyanstore/cyan_store.cc
+index cf45dbb556f47..cc2102d033e01 100644
+--- a/src/crimson/os/cyanstore/cyan_store.cc
++++ b/src/crimson/os/cyanstore/cyan_store.cc
+@@ -66,8 +66,8 @@ seastar::future<> CyanStore::get_shard_nums()
+     }
+   }
+   if (store_shard_nums == 0) {
+-    // If no collections files found, assume seastar::smp::count shards
+-    store_shard_nums = seastar::smp::count;
++    // If no collections files found, assume seastar::this_smp_shard_count() shards
++    store_shard_nums = seastar::this_smp_shard_count();
+   }
+   return seastar::make_ready_future<>();
+ }
+@@ -76,8 +76,8 @@ seastar::future<uint32_t> CyanStore::start()
+ {
+   ceph_assert(seastar::this_shard_id() == primary_core);
+   return get_shard_nums().then([this] {
+-    auto num_shard_services = (store_shard_nums + seastar::smp::count - 1 ) / seastar::smp::count;
+-    logger().info("store_shard_nums={} seastar::smp={}, num_shard_services={}", store_shard_nums, seastar::smp::count, num_shard_services);
++    auto num_shard_services = (store_shard_nums + seastar::this_smp_shard_count() - 1 ) / seastar::this_smp_shard_count();
++    logger().info("store_shard_nums={} seastar::smp={}, num_shard_services={}", store_shard_nums, seastar::this_smp_shard_count(), num_shard_services);
+     return shard_stores.start(num_shard_services, path, store_shard_nums);
+   }).then([this] {
+     logger().debug("CyanStore started with {} shard stores", store_shard_nums);
+@@ -261,7 +261,7 @@ CyanStore::mount_ertr::future<> CyanStore::Shard::mount()
+   static const char read_file_errmsg[]{"read_file"};
+   ceph::bufferlist bl;
+   std::string fn =
+-    path + "/collections" + std::to_string(seastar::this_shard_id() + seastar::smp::count * store_index);
++    path + "/collections" + std::to_string(seastar::this_shard_id() + seastar::this_smp_shard_count() * store_index);
+   std::string err;
+   if (int r = bl.read_file(fn.c_str(), &err); r < 0) {
+     return crimson::stateful_ec{ singleton_ec<read_file_errmsg>() };
+@@ -273,7 +273,7 @@ CyanStore::mount_ertr::future<> CyanStore::Shard::mount()
+ 
+   for (auto& coll : collections) {
+     std::string fn = fmt::format("{}/{}{}", path, coll,
+-      std::to_string(seastar::this_shard_id() + seastar::smp::count * store_index));
++      std::to_string(seastar::this_shard_id() + seastar::this_smp_shard_count() * store_index));
+     ceph::bufferlist cbl;
+     if (int r = cbl.read_file(fn.c_str(), &err); r < 0) {
+       return crimson::stateful_ec{ singleton_ec<read_file_errmsg>() };
+@@ -300,13 +300,13 @@ seastar::future<> CyanStore::Shard::umount()
+       ceph_assert(ch);
+       ch->encode(bl);
+       std::string fn = fmt::format("{}/{}{}", path, col,
+-        std::to_string(seastar::this_shard_id()+ seastar::smp::count * store_index));
++        std::to_string(seastar::this_shard_id()+ seastar::this_smp_shard_count() * store_index));
+       return crimson::write_file(std::move(bl), fn);
+     }).then([&collections, this] {
+       ceph::bufferlist bl;
+       ceph::encode(collections, bl);
+       std::string fn = fmt::format("{}/collections{}",
+-        path, std::to_string(seastar::this_shard_id()+ seastar::smp::count * store_index));
++        path, std::to_string(seastar::this_shard_id()+ seastar::this_smp_shard_count() * store_index));
+       return crimson::write_file(std::move(bl), fn);
+     });
+   });
+diff --git a/src/crimson/os/futurized_store.h b/src/crimson/os/futurized_store.h
+index 5036d9ab458c3..4c957b9af1cb3 100644
+--- a/src/crimson/os/futurized_store.h
++++ b/src/crimson/os/futurized_store.h
+@@ -45,7 +45,7 @@ class FuturizedStore {
+     const Shard& operator=(const Shard& o) = delete;
+ 
+     bool is_shard_store_active(store_index_t store_index, uint32_t store_shard_nums) {
+-      if(seastar::this_shard_id() + seastar::smp::count * store_index >= store_shard_nums) {
++      if(seastar::this_shard_id() + seastar::this_smp_shard_count() * store_index >= store_shard_nums) {
+         // store_index is out of range {} - inactivating this store shard
+         return false;
+       }
+diff --git a/src/crimson/os/seastore/device.cc b/src/crimson/os/seastore/device.cc
+index bd6231fa94b6d..2da0593a008d5 100644
+--- a/src/crimson/os/seastore/device.cc
++++ b/src/crimson/os/seastore/device.cc
+@@ -54,7 +54,7 @@ void device_superblock_t::validate() const
+   ceph_assert(version == CRIMSON_DEVICE_SUPERBLOCK_VERSION);
+   if (crimson::common::get_conf<bool>(
+           "seastore_require_partition_count_match_reactor_count")) {
+-    ceph_assert(shard_num == seastar::smp::count);
++    ceph_assert(shard_num == seastar::this_smp_shard_count());
+   }
+   ceph_assert(block_size > 0);
+   ceph_assert(config.spec.magic != 0);
+diff --git a/src/crimson/os/seastore/device.h b/src/crimson/os/seastore/device.h
+index d3f7dfba0411d..19dd1c9b2c5a4 100644
+--- a/src/crimson/os/seastore/device.h
++++ b/src/crimson/os/seastore/device.h
+@@ -381,7 +381,7 @@ class Device {
+     });
+   }
+   virtual read_ertr::future<uint32_t> get_shard_nums() {
+-    return read_ertr::make_ready_future<uint32_t>(seastar::smp::count);
++    return read_ertr::make_ready_future<uint32_t>(seastar::this_smp_shard_count());
+   }
+ };
+ 
+diff --git a/src/crimson/os/seastore/random_block_manager/nvme_block_device.cc b/src/crimson/os/seastore/random_block_manager/nvme_block_device.cc
+index 76ff03f9aee13..ad59842fb1f0c 100644
+--- a/src/crimson/os/seastore/random_block_manager/nvme_block_device.cc
++++ b/src/crimson/os/seastore/random_block_manager/nvme_block_device.cc
+@@ -22,9 +22,9 @@ namespace crimson::os::seastore::random_block_device::nvme {
+ seastar::future<> NVMeBlockDevice::start(uint32_t shard_nums)
+ {
+   device_shard_nums = shard_nums;
+-  auto num_shard_services = (device_shard_nums + seastar::smp::count - 1 ) / seastar::smp::count;
++  auto num_shard_services = (device_shard_nums + seastar::this_smp_shard_count() - 1 ) / seastar::this_smp_shard_count();
+   LOG_PREFIX(NVMeBlockDevice::start);
+-  DEBUG("device_shard_nums={} seastar::smp={}, num_shard_services={}", device_shard_nums, seastar::smp::count, num_shard_services);
++  DEBUG("device_shard_nums={} seastar::smp={}, num_shard_services={}", device_shard_nums, seastar::this_smp_shard_count(), num_shard_services);
+   return shard_devices.start(num_shard_services, device_path);
+ 
+ }
+@@ -43,7 +43,7 @@ Device& NVMeBlockDevice::get_sharded_device(store_index_t store_index)
+ NVMeBlockDevice::mkfs_ret NVMeBlockDevice::mkfs(device_config_t config) {
+   using crimson::common::get_conf;
+   co_await shard_devices.local().mshard_devices[0]->do_primary_mkfs(config,
+-    seastar::smp::count,
++    seastar::this_smp_shard_count(),
+     get_conf<Option::size_t>("seastore_cbjournal_size") 
+   );
+ }
+diff --git a/src/crimson/os/seastore/random_block_manager/rbm_device.cc b/src/crimson/os/seastore/random_block_manager/rbm_device.cc
+index b965f3f999718..083386b212d68 100644
+--- a/src/crimson/os/seastore/random_block_manager/rbm_device.cc
++++ b/src/crimson/os/seastore/random_block_manager/rbm_device.cc
+@@ -217,15 +217,15 @@ RBMDevice::mount_ret RBMDevice::do_shard_mount()
+     "Invalid error read_rbm_superblock in RBMDevice::do_shard_mount")
+   );
+   LOG_PREFIX(RBMDevice::do_shard_mount);
+-  if(seastar::this_shard_id() + seastar::smp::count * store_index >= s.shard_num) {
++  if(seastar::this_shard_id() + seastar::this_smp_shard_count() * store_index >= s.shard_num) {
+     INFO("{} shard_id {} out of range {}",
+          device_id_printer_t{get_device_id()},
+-         seastar::this_shard_id() + seastar::smp::count * store_index,
++         seastar::this_shard_id() + seastar::this_smp_shard_count() * store_index,
+          s.shard_num);
+     shard_status = false;
+     co_return;
+   }
+-  shard_info = s.shard_infos[seastar::this_shard_id() + seastar::smp::count * store_index];
++  shard_info = s.shard_infos[seastar::this_shard_id() + seastar::this_smp_shard_count() * store_index];
+   INFO("{} read {}", device_id_printer_t{get_device_id()}, shard_info);
+   s.validate();
+ }
+@@ -259,7 +259,7 @@ read_ertr::future<uint32_t> RBMDevice::get_shard_nums()
+ EphemeralRBMDeviceRef create_test_ephemeral(uint64_t journal_size, uint64_t data_size) {
+   return EphemeralRBMDeviceRef(
+     new EphemeralRBMDevice(
+-      (journal_size + data_size) * seastar::smp::count +
++      (journal_size + data_size) * seastar::this_smp_shard_count() +
+ 	random_block_device::RBMDevice::get_shard_reserved_size(),
+ 	EphemeralRBMDevice::TEST_BLOCK_SIZE));
+ }
+@@ -359,7 +359,7 @@ EphemeralRBMDevice::mount_ret EphemeralRBMDevice::mount() {
+ }
+ 
+ EphemeralRBMDevice::mkfs_ret EphemeralRBMDevice::mkfs(device_config_t config) {
+-  return do_primary_mkfs(config, seastar::smp::count, DEFAULT_TEST_CBJOURNAL_SIZE);
++  return do_primary_mkfs(config, seastar::this_smp_shard_count(), DEFAULT_TEST_CBJOURNAL_SIZE);
+ }
+ 
+ }
+diff --git a/src/crimson/os/seastore/seastore.cc b/src/crimson/os/seastore/seastore.cc
+index d816527047601..ab16b0a6b2a6b 100644
+--- a/src/crimson/os/seastore/seastore.cc
++++ b/src/crimson/os/seastore/seastore.cc
+@@ -144,7 +144,7 @@ SeaStore::SeaStore(
+   : root(root),
+     mdstore(std::move(mdstore))
+ {
+-  store_shard_nums = seastar::smp::count;
++  store_shard_nums = seastar::this_smp_shard_count();
+ }
+ 
+ SeaStore::~SeaStore() = default;
+@@ -280,7 +280,7 @@ seastar::future<> SeaStore::get_shard_nums()
+   auto [done, value] = tuple;
+   if (done == -1) {
+     INFO("seastore not mkfs yet");
+-    store_shard_nums = seastar::smp::count;
++    store_shard_nums = seastar::this_smp_shard_count();
+     co_return;
+   } else {
+     INFO("seastore mkfs done");
+@@ -293,8 +293,8 @@ seastar::future<> SeaStore::get_shard_nums()
+     store_shard_nums = shard_nums;
+     if(crimson::common::get_conf<bool>("seastore_require_partition_count_match_reactor_count")) {
+       INFO("seastore doesn't allow shard change");
+-      if (store_shard_nums != seastar::smp::count) {
+-        INFO("seastore shards {} do not match seastar::smp {}", store_shard_nums, seastar::smp::count);
++      if (store_shard_nums != seastar::this_smp_shard_count()) {
++        INFO("seastore shards {} do not match seastar::smp {}", store_shard_nums, seastar::this_smp_shard_count());
+         ceph_abort_msg("seastore_require_partition_count_match_reactor_count is true, seastore shards do not match seastar::smp");
+       }
+     }
+@@ -305,8 +305,8 @@ seastar::future<> SeaStore::get_shard_nums()
+ seastar::future<> SeaStore::shard_stores_start(bool is_test)
+ {
+   LOG_PREFIX(SeaStore::shard_stores_start);
+-  auto num_shard_services = (store_shard_nums + seastar::smp::count - 1 ) / seastar::smp::count;
+-  INFO("store_shard_nums={} seastar::smp={}, num_shard_services={}", store_shard_nums, seastar::smp::count, num_shard_services);
++  auto num_shard_services = (store_shard_nums + seastar::this_smp_shard_count() - 1 ) / seastar::this_smp_shard_count();
++  INFO("store_shard_nums={} seastar::smp={}, num_shard_services={}", store_shard_nums, seastar::this_smp_shard_count(), num_shard_services);
+   return shard_stores.start(num_shard_services, root, device.get(), is_test, store_shard_nums);
+ }
+ 
+@@ -353,7 +353,7 @@ seastar::future<> SeaStore::test_start(DeviceRef device_obj)
+   ceph_assert(device_obj);
+   ceph_assert(root == "");
+   device = std::move(device_obj);
+-  co_await shard_stores.start_single(1, root, device.get(), true, seastar::smp::count);
++  co_await shard_stores.start_single(1, root, device.get(), true, seastar::this_smp_shard_count());
+   INFO("done");
+ }
+ 
+@@ -785,11 +785,11 @@ seastar::future<> SeaStore::report_stats()
+         report_detail = true;
+         seconds = mshard_store->reset_report_interval();
+       }
+-      shard_device_stats[seastar::this_shard_id() + seastar::smp::count * mshard_store->get_store_index()] =
++      shard_device_stats[seastar::this_shard_id() + seastar::this_smp_shard_count() * mshard_store->get_store_index()] =
+         mshard_store->get_device_stats(report_detail, seconds);
+-      shard_io_stats[seastar::this_shard_id() + seastar::smp::count * mshard_store->get_store_index()] =
++      shard_io_stats[seastar::this_shard_id() + seastar::this_smp_shard_count() * mshard_store->get_store_index()] =
+         mshard_store->get_io_stats(report_detail, seconds);
+-      shard_cache_stats[seastar::this_shard_id() + seastar::smp::count * mshard_store->get_store_index()] =
++      shard_cache_stats[seastar::this_shard_id() + seastar::this_smp_shard_count() * mshard_store->get_store_index()] =
+         mshard_store->get_cache_stats(report_detail, seconds);
+     });
+   }).then([this, FNAME] {
+@@ -814,7 +814,7 @@ seastar::future<> SeaStore::report_stats()
+     oss_iops << "device IOPS: "
+              << fmt::format(dfmt, iops)
+              << " "
+-             << fmt::format(dfmt, iops/seastar::smp::count)
++             << fmt::format(dfmt, iops/seastar::this_smp_shard_count())
+              << "(";
+ 
+     std::ostringstream oss_bd;
+@@ -822,7 +822,7 @@ seastar::future<> SeaStore::report_stats()
+     oss_bd << "device bandwidth(MiB): "
+            << fmt::format(dfmt, bd_mb)
+            << " "
+-           << fmt::format(dfmt, bd_mb/seastar::smp::count)
++           << fmt::format(dfmt, bd_mb/seastar::this_smp_shard_count())
+            << "(";
+ 
+     for (const auto &s : shard_device_stats) {
+@@ -848,10 +848,10 @@ seastar::future<> SeaStore::report_stats()
+          io_total.read_num/seconds,
+          io_total.get_bg_num()/seconds,
+          io_total.flush_num/seconds,
+-         io_total.io_num/seconds/seastar::smp::count,
+-         io_total.read_num/seconds/seastar::smp::count,
+-         io_total.get_bg_num()/seconds/seastar::smp::count,
+-         io_total.flush_num/seconds/seastar::smp::count);
++         io_total.io_num/seconds/seastar::this_smp_shard_count(),
++         io_total.read_num/seconds/seastar::this_smp_shard_count(),
++         io_total.get_bg_num()/seconds/seastar::this_smp_shard_count(),
++         io_total.flush_num/seconds/seastar::this_smp_shard_count());
+     auto calc_conflicts = [](uint64_t ios, uint64_t repeats) {
+       return (double)(repeats-ios)/ios;
+     };
+@@ -865,15 +865,15 @@ seastar::future<> SeaStore::report_stats()
+          io_total.pending_read_num,
+          io_total.pending_bg_num,
+          io_total.pending_flush_num,
+-         (double)io_total.pending_io_num/seastar::smp::count,
+-         (double)io_total.starting_io_num/seastar::smp::count,
+-         (double)io_total.waiting_collock_io_num/seastar::smp::count,
+-         (double)io_total.waiting_throttler_io_num/seastar::smp::count,
+-         (double)io_total.processing_inlock_io_num/seastar::smp::count,
+-         (double)io_total.processing_postlock_io_num/seastar::smp::count,
+-         (double)io_total.pending_read_num/seastar::smp::count,
+-         (double)io_total.pending_bg_num/seastar::smp::count,
+-         (double)io_total.pending_flush_num/seastar::smp::count);
++         (double)io_total.pending_io_num/seastar::this_smp_shard_count(),
++         (double)io_total.starting_io_num/seastar::this_smp_shard_count(),
++         (double)io_total.waiting_collock_io_num/seastar::this_smp_shard_count(),
++         (double)io_total.waiting_throttler_io_num/seastar::this_smp_shard_count(),
++         (double)io_total.processing_inlock_io_num/seastar::this_smp_shard_count(),
++         (double)io_total.processing_postlock_io_num/seastar::this_smp_shard_count(),
++         (double)io_total.pending_read_num/seastar::this_smp_shard_count(),
++         (double)io_total.pending_bg_num/seastar::this_smp_shard_count(),
++         (double)io_total.pending_flush_num/seastar::this_smp_shard_count());
+ 
+     std::ostringstream oss_pending;
+     for (const auto &s : shard_io_stats) {
+@@ -893,9 +893,9 @@ seastar::future<> SeaStore::report_stats()
+     }
+ 
+     cache_size_stats_t queue_sizes_ps = cache_total.pinboard_sizes;
+-    queue_sizes_ps.divide_by(seastar::smp::count);
++    queue_sizes_ps.divide_by(seastar::this_smp_shard_count());
+     cache_io_stats_t queue_io_ps = cache_total.pinboard_io;
+-    queue_io_ps.divide_by(seastar::smp::count);
++    queue_io_ps.divide_by(seastar::this_smp_shard_count());
+     INFO("cache pinboard: total{} {}; per-shard: total{} {}",
+          cache_total.pinboard_sizes,
+          cache_io_stats_printer_t{seconds, cache_total.pinboard_io},
+@@ -903,9 +903,9 @@ seastar::future<> SeaStore::report_stats()
+          cache_io_stats_printer_t{seconds, queue_io_ps});
+ 
+     cache_size_stats_t dirty_sizes_ps = cache_total.dirty_sizes;
+-    dirty_sizes_ps.divide_by(seastar::smp::count);
++    dirty_sizes_ps.divide_by(seastar::this_smp_shard_count());
+     dirty_io_stats_t dirty_io_ps = cache_total.dirty_io;
+-    dirty_io_ps.divide_by(seastar::smp::count);
++    dirty_io_ps.divide_by(seastar::this_smp_shard_count());
+     INFO("cache dirty: total{} {}; per-shard: total{} {}",
+          cache_total.dirty_sizes,
+          dirty_io_stats_printer_t{seconds, cache_total.dirty_io},
+@@ -913,7 +913,7 @@ seastar::future<> SeaStore::report_stats()
+          dirty_io_stats_printer_t{seconds, dirty_io_ps});
+ 
+     cache_access_stats_t access_ps = cache_total.access;
+-    access_ps.divide_by(seastar::smp::count);
++    access_ps.divide_by(seastar::this_smp_shard_count());
+     INFO("cache_access: total{}; per-shard{}",
+          cache_access_stats_printer_t{seconds, cache_total.access},
+          cache_access_stats_printer_t{seconds, access_ps});
+diff --git a/src/crimson/os/seastore/segment_manager/block.cc b/src/crimson/os/seastore/segment_manager/block.cc
+index 7c33b1c9c7de2..118aa889de902 100644
+--- a/src/crimson/os/seastore/segment_manager/block.cc
++++ b/src/crimson/os/seastore/segment_manager/block.cc
+@@ -255,15 +255,15 @@ device_superblock_t make_superblock(
+     "seastore_segment_size");
+   size_t raw_segments = size / config_segment_size;
+   size_t shard_tracker_size = SegmentStateTracker::get_raw_size(
+-    raw_segments / seastar::smp::count,
++    raw_segments / seastar::this_smp_shard_count(),
+     data.block_size);
+-  size_t total_tracker_size = shard_tracker_size * seastar::smp::count;
++  size_t total_tracker_size = shard_tracker_size * seastar::this_smp_shard_count();
+   size_t tracker_off = data.block_size;   //superblock
+   size_t segments = (size - tracker_off - total_tracker_size) / config_segment_size;
+-  size_t segments_per_shard = segments / seastar::smp::count;
++  size_t segments_per_shard = segments / seastar::this_smp_shard_count();
+ 
+-  vector<device_shard_info_t> shard_infos(seastar::smp::count);
+-  for (unsigned int i = 0; i < seastar::smp::count; i++) {
++  vector<device_shard_info_t> shard_infos(seastar::this_smp_shard_count());
++  for (unsigned int i = 0; i < seastar::this_smp_shard_count(); i++) {
+     shard_infos[i].size = segments_per_shard * config_segment_size;
+     shard_infos[i].segments = segments_per_shard;
+     shard_infos[i].tracker_offset = tracker_off + i * shard_tracker_size;
+@@ -276,12 +276,12 @@ device_superblock_t make_superblock(
+        size,
+        uint64_t(config_segment_size),
+        data.block_size);
+-  for (unsigned int i = 0; i < seastar::smp::count; i++) {
++  for (unsigned int i = 0; i < seastar::this_smp_shard_count(); i++) {
+     INFO("shard {} infos: {}", i, shard_infos[i]);
+   }
+ 
+   return device_superblock_t::make_segmented(
+-    seastar::smp::count,
++    seastar::this_smp_shard_count(),
+     config_segment_size,
+     data.block_size,
+     std::move(sm_config),
+@@ -492,8 +492,8 @@ seastar::future<> BlockSegmentManager::start(uint32_t shard_nums)
+ {
+   LOG_PREFIX(BlockSegmentManager::start);
+   device_shard_nums = shard_nums;
+-  auto num_shard_services = (device_shard_nums + seastar::smp::count - 1 ) / seastar::smp::count;
+-  INFO("device_shard_nums={} seastar::smp={}, num_shard_services={}", device_shard_nums, seastar::smp::count, num_shard_services);
++  auto num_shard_services = (device_shard_nums + seastar::this_smp_shard_count() - 1 ) / seastar::this_smp_shard_count();
++  INFO("device_shard_nums={} seastar::smp={}, num_shard_services={}", device_shard_nums, seastar::this_smp_shard_count(), num_shard_services);
+   return shard_devices.start(num_shard_services, device_path, superblock.config.spec.dtype);
+ 
+ }
+@@ -550,15 +550,15 @@ BlockSegmentManager::mount_ret BlockSegmentManager::shard_mount()
+     return read_superblock(device, sd);
+   }).safe_then([=, this](auto sb) ->mount_ertr::future<> {
+     set_device_id(sb.config.spec.id);
+-    if(seastar::this_shard_id() + seastar::smp::count * store_index >= sb.shard_num) {
++    if(seastar::this_shard_id() + seastar::this_smp_shard_count() * store_index >= sb.shard_num) {
+       INFO("{} shard_id {} out of range {}",
+       device_id_printer_t{get_device_id()},
+-        seastar::this_shard_id() + seastar::smp::count * store_index,
++        seastar::this_shard_id() + seastar::this_smp_shard_count() * store_index,
+         sb.shard_num);
+       shard_status = false;
+       return mount_ertr::now();
+     }
+-    shard_info = sb.shard_infos[seastar::this_shard_id() + seastar::smp::count * store_index];
++    shard_info = sb.shard_infos[seastar::this_shard_id() + seastar::this_smp_shard_count() * store_index];
+     INFO("{} read {}", device_id_printer_t{get_device_id()}, shard_info);
+     sb.validate();
+     superblock = sb;
+diff --git a/src/crimson/os/seastore/segment_manager/zbd.cc b/src/crimson/os/seastore/segment_manager/zbd.cc
+index e34b15f6d4fe2..bfbd764dc7aa2 100644
+--- a/src/crimson/os/seastore/segment_manager/zbd.cc
++++ b/src/crimson/os/seastore/segment_manager/zbd.cc
+@@ -49,8 +49,8 @@ seastar::future<> ZBDSegmentManager::start(uint32_t shard_nums)
+ {
+   LOG_PREFIX(ZBDSegmentManager::start);
+   device_shard_nums = shard_nums;
+-  auto num_shard_services = (device_shard_nums + seastar::smp::count - 1 ) / seastar::smp::count;
+-  INFO("device_shard_nums={} seastar::smp={}, num_shard_services={}", device_shard_nums, seastar::smp::count, num_shard_services);
++  auto num_shard_services = (device_shard_nums + seastar::this_smp_shard_count() - 1 ) / seastar::this_smp_shard_count();
++  INFO("device_shard_nums={} seastar::smp={}, num_shard_services={}", device_shard_nums, seastar::this_smp_shard_count(), num_shard_services);
+   return shard_devices.start(num_shard_services, device_path);
+ 
+ }
+@@ -114,7 +114,7 @@ static device_superblock_t make_metadata(
+   size_t segment_size = zone_size;
+   size_t zones_per_segment = segment_size / zone_size;
+   size_t segments = (num_zones - skipped_zones) / zones_per_segment;
+-  size_t per_shard_segments = segments / seastar::smp::count;
++  size_t per_shard_segments = segments / seastar::this_smp_shard_count();
+   size_t available_size = zone_capacity * segments;
+   size_t per_shard_available_size = zone_capacity * per_shard_segments;
+ 
+@@ -142,8 +142,8 @@ static device_superblock_t make_metadata(
+     per_shard_segments,
+     per_shard_available_size);
+ 
+-  std::vector<device_shard_info_t> shard_infos(seastar::smp::count);
+-  for (unsigned int i = 0; i < seastar::smp::count; i++) {
++  std::vector<device_shard_info_t> shard_infos(seastar::this_smp_shard_count());
++  for (unsigned int i = 0; i < seastar::this_smp_shard_count(); i++) {
+     shard_infos[i].size = per_shard_available_size;
+     shard_infos[i].segments = per_shard_segments;
+     shard_infos[i].first_segment_offset = zone_size * skipped_zones
+@@ -153,7 +153,7 @@ static device_superblock_t make_metadata(
+   }
+ 
+   auto ret = device_superblock_t::make_zbd(
+-    seastar::smp::count,
++    seastar::this_smp_shard_count(),
+     segment_size,
+     data.block_size,
+     std::move(config),
+@@ -517,15 +517,15 @@ ZBDSegmentManager::mount_ret ZBDSegmentManager::shard_mount()
+     return read_metadata(device, sd);
+   }).safe_then([=, this](auto meta){
+     LOG_PREFIX(ZBDSegmentManager::shard_mount);
+-    if(seastar::this_shard_id() + seastar::smp::count * store_index >= meta.shard_num) {
++    if(seastar::this_shard_id() + seastar::this_smp_shard_count() * store_index >= meta.shard_num) {
+       INFO("{} shard_id {} out of range {}",
+         device_id_printer_t{get_device_id()},
+-        seastar::this_shard_id() + seastar::smp::count * store_index,
++        seastar::this_shard_id() + seastar::this_smp_shard_count() * store_index,
+         meta.shard_num);
+       shard_status = false;
+       return mount_ertr::now();
+     }
+-    shard_info = meta.shard_infos[seastar::this_shard_id() + seastar::smp::count * store_index];
++    shard_info = meta.shard_infos[seastar::this_shard_id() + seastar::this_smp_shard_count() * store_index];
+     metadata = meta;
+     return mount_ertr::now();
+   });
+diff --git a/src/crimson/osd/osd.cc b/src/crimson/osd/osd.cc
+index d742eef94be19..9ed6dcf9a8551 100644
+--- a/src/crimson/osd/osd.cc
++++ b/src/crimson/osd/osd.cc
+@@ -485,7 +485,7 @@ seastar::future<> OSD::report_osd_stats()
+ seastar::future<> OSD::start()
+ {
+   LOG_PREFIX(OSD::start);
+-  INFO("seastar::smp::count {}", seastar::smp::count);
++  INFO("smp shard count {}", seastar::this_smp_shard_count());
+   if (auto cpu_cores =
+         local_conf().get_val<std::string>("crimson_cpu_set");
+       cpu_cores.empty()) {
+@@ -495,7 +495,7 @@ seastar::future<> OSD::start()
+   ceph_assert(seastar::this_shard_id() == PRIMARY_CORE);
+   DEBUG("starting store");
+   uint32_t store_shards_num = co_await store.start();
+-  co_await pg_to_shard_mappings.start(0, seastar::smp::count, store_shards_num);
++  co_await pg_to_shard_mappings.start(0, seastar::this_smp_shard_count(), store_shards_num);
+   co_await osd_singleton_state.start_single(
+         whoami, std::ref(*cluster_msgr), std::ref(*public_msgr),
+         std::ref(*monc), std::ref(*mgrc));
+@@ -520,7 +520,7 @@ seastar::future<> OSD::start()
+     );
+   auto stats_seconds = local_conf().get_val<int64_t>("crimson_osd_stat_interval");
+   if (stats_seconds > 0) {
+-    shard_stats.resize(seastar::smp::count);
++    shard_stats.resize(seastar::this_smp_shard_count());
+     stats_timer.set_callback([this] {
+       gate.dispatch_in_background("stats_osd", *this, [this] {
+         return report_osd_stats();
+diff --git a/src/crimson/osd/osd_operation.cc b/src/crimson/osd/osd_operation.cc
+index 41b630eb76794..3c66dce5f1e6c 100644
+--- a/src/crimson/osd/osd_operation.cc
++++ b/src/crimson/osd/osd_operation.cc
+@@ -174,7 +174,7 @@ OperationThrottler::OperationThrottler(ConfigProxy &conf)
+ 
+ void OperationThrottler::initialize_scheduler(CephContext *cct, ConfigProxy &conf, bool is_rotational, int whoami)
+ {
+-  scheduler = crimson::osd::scheduler::make_scheduler(cct, conf, whoami, seastar::smp::count,
++  scheduler = crimson::osd::scheduler::make_scheduler(cct, conf, whoami, seastar::this_smp_shard_count(),
+             seastar::this_shard_id(), is_rotational, true);
+   update_from_config(conf);
+ }
+diff --git a/src/crimson/osd/pg.cc b/src/crimson/osd/pg.cc
+index f79e8272d9947..9da13bbffe3d6 100644
+--- a/src/crimson/osd/pg.cc
++++ b/src/crimson/osd/pg.cc
+@@ -351,7 +351,7 @@ unsigned PG::get_target_pg_log_entries() const
+   const unsigned local_num_pgs = shard_services.get_num_local_pgs();
+   const unsigned local_target =
+     local_conf().get_val<uint64_t>("osd_target_pg_log_entries_per_osd") /
+-    seastar::smp::count;
++    seastar::this_smp_shard_count();
+   const unsigned min_pg_log_entries =
+     local_conf().get_val<uint64_t>("osd_min_pg_log_entries");
+   if (local_num_pgs > 0 && local_target > 0) {
+diff --git a/src/crimson/osd/pg_map.cc b/src/crimson/osd/pg_map.cc
+index 3fce70fe9cba6..d21eba99e8fab 100644
+--- a/src/crimson/osd/pg_map.cc
++++ b/src/crimson/osd/pg_map.cc
+@@ -14,7 +14,7 @@ namespace crimson::osd {
+ 
+ seastar::future<> PGShardMapping::dump_store_shards(Formatter *f) const {
+   f->dump_int("this shard id", seastar::this_shard_id());
+-  f->dump_int("osd shard nums", seastar::smp::count);
++  f->dump_int("osd shard nums", seastar::this_smp_shard_count());
+   f->dump_int("store_shard_nums", store_shard_nums);
+ 
+   for (const auto &i : core_to_num_pgs) {
+@@ -24,7 +24,7 @@ seastar::future<> PGShardMapping::dump_store_shards(Formatter *f) const {
+     f->close_section();
+   }
+ 
+-  if (seastar::smp::count < store_shard_nums) {
++  if (seastar::this_smp_shard_count() < store_shard_nums) {
+     for (auto i = core_shard_to_num_pgs.begin();
+          i != core_shard_to_num_pgs.end(); ++i) {
+       f->open_object_section("core_store");
+@@ -39,7 +39,7 @@ seastar::future<> PGShardMapping::dump_store_shards(Formatter *f) const {
+       f->close_section();
+     }
+   }
+-  if(seastar::smp::count > store_shard_nums) {
++  if(seastar::this_smp_shard_count() > store_shard_nums) {
+     for (auto i = core_alien_to_num_pgs.begin();
+          i != core_alien_to_num_pgs.end(); ++i) {
+       f->open_object_section("core_alien");
+@@ -130,7 +130,7 @@ seastar::future<std::pair<core_id_t, store_index_t>> PGShardMapping::get_or_crea
+         if(crimson::common::get_conf<bool>("seastore_require_partition_count_match_reactor_count")) {
+           shard_index_update = 0;
+         } else {
+-          if (seastar::smp::count > store_shard_nums ) {
++          if (seastar::this_smp_shard_count() > store_shard_nums ) {
+             auto alien_iter = primary_mapping.core_alien_to_num_pgs.find(core_to_update);
+             auto core_iter = std::min_element(
+               alien_iter->second.begin(),
+@@ -142,7 +142,7 @@ seastar::future<std::pair<core_id_t, store_index_t>> PGShardMapping::get_or_crea
+             core_iter->second++;
+             core_to_update = core_iter->first;
+           }
+-          if (seastar::smp::count >= store_shard_nums) {
++          if (seastar::this_smp_shard_count() >= store_shard_nums) {
+             shard_index_update = 0; // use the first store shard index on this core
+           } else {
+             core_shard_iter = primary_mapping.core_shard_to_num_pgs.find(core_to_update);
+@@ -201,7 +201,7 @@ seastar::future<std::pair<core_id_t, store_index_t>> PGShardMapping::get_or_crea
+       }
+       auto core_found = find_iter->second.first;
+       auto shard_index_found = find_iter->second.second;
+-      if (seastar::smp::count <= store_shard_nums) {
++      if (seastar::this_smp_shard_count() <= store_shard_nums) {
+         if ((core_expected != NULL_CORE && core_found != core_expected) ||
+           (store_index != NULL_STORE_INDEX && shard_index_found != store_index)) {
+           ERROR("the mapping is inconsistent for pg {}: core {}, expected {}",
+@@ -240,7 +240,7 @@ seastar::future<> PGShardMapping::remove_pg_mapping(spg_t pgid) {
+     auto core_shard_iter = primary_mapping.core_shard_to_num_pgs.find(find_iter->second.first);
+     auto shard_iter = core_shard_iter->second.find(find_iter->second.second);
+     assert(shard_iter != core_shard_iter->second.end());
+-    if (seastar::smp::count < primary_mapping.store_shard_nums) {
++    if (seastar::this_smp_shard_count() < primary_mapping.store_shard_nums) {
+       assert(shard_iter->second > 0);
+       --(shard_iter->second);
+     }
+diff --git a/src/crimson/osd/pg_map.h b/src/crimson/osd/pg_map.h
+index 13d071e92828a..4ba3a54020305 100644
+--- a/src/crimson/osd/pg_map.h
++++ b/src/crimson/osd/pg_map.h
+@@ -52,12 +52,12 @@ class PGShardMapping : public seastar::peering_sharded_service<PGShardMapping> {
+     : store_shard_nums(store_shard_nums) {
+     ceph_assert_always(min_core_mapping < core_mapping_limit);
+     auto max_core_mapping = std::min(min_core_mapping + store_shard_nums, core_mapping_limit);
+-    auto num_shard_services = (store_shard_nums + seastar::smp::count - 1 ) / seastar::smp::count;
+-    auto num_alien_cores = (seastar::smp::count + store_shard_nums -1 ) / store_shard_nums;
++    auto num_shard_services = (store_shard_nums + seastar::this_smp_shard_count() - 1 ) / seastar::this_smp_shard_count();
++    auto num_alien_cores = (seastar::this_smp_shard_count() + store_shard_nums -1 ) / store_shard_nums;
+ 
+     for (auto i = min_core_mapping; i != max_core_mapping; ++i) {
+       for (unsigned int j = 0; j < num_shard_services; ++j) {
+-        if (i - min_core_mapping + j * seastar::smp::count < store_shard_nums) {
++        if (i - min_core_mapping + j * seastar::this_smp_shard_count() < store_shard_nums) {
+           core_shard_to_num_pgs[i].emplace(j, 0);
+         }
+       }
+diff --git a/src/crimson/osd/pg_shard_manager.h b/src/crimson/osd/pg_shard_manager.h
+index fcc16ef1ec504..69fd4194b88da 100644
+--- a/src/crimson/osd/pg_shard_manager.h
++++ b/src/crimson/osd/pg_shard_manager.h
+@@ -87,7 +87,7 @@ class PGShardManager {
+     return seastar::do_with(
+       std::vector<seastar::foreign_ptr<local_cached_map_t>>(),
+       [this, map](auto &fmaps) {
+-	fmaps.resize(seastar::smp::count);
++	fmaps.resize(seastar::this_smp_shard_count());
+ 	for (auto &i: fmaps) {
+ 	  i = seastar::foreign_ptr(map);
+ 	}
+diff --git a/src/crimson/tools/perf_crimson_msgr.cc b/src/crimson/tools/perf_crimson_msgr.cc
+index 267e76356a565..3c89453386b8b 100644
+--- a/src/crimson/tools/perf_crimson_msgr.cc
++++ b/src/crimson/tools/perf_crimson_msgr.cc
+@@ -327,7 +327,7 @@ static seastar::future<> run(
+         seastar::promise<> pr_report;
+         fut_report = pr_report.get_future();
+         seastar::do_with(
+-            TimerReport(seastar::smp::count),
++            TimerReport(seastar::this_smp_shard_count()),
+             [this](auto &report) {
+           return seastar::do_until(
+             [this] { return is_stopped; },
+@@ -588,7 +588,7 @@ static seastar::future<> run(
+              unsigned nonce_base,
+              std::optional<unsigned> server_sid)
+         : sid{seastar::this_shard_id()},
+-          id{sid + num_clients - seastar::smp::count},
++          id{sid + num_clients - seastar::this_smp_shard_count()},
+           server_sid{server_sid},
+           num_clients{num_clients},
+           num_conns{num_conns},
+@@ -650,7 +650,7 @@ static seastar::future<> run(
+       // should start messenger at this shard?
+       bool is_active() {
+         ceph_assert(seastar::this_shard_id() == sid);
+-        return sid + num_clients >= seastar::smp::count;
++        return sid + num_clients >= seastar::this_smp_shard_count();
+       }
+ 
+       seastar::future<> init() {
+@@ -1114,14 +1114,14 @@ static seastar::future<> run(
+     // reserve core 0 for potentially better performance
+     if (mode == perf_mode_t::both) {
+       logger().info("\nperf settings:\n  smp={}\n  {}\n  {}\n",
+-                    seastar::smp::count, client_conf.str(), server_conf.str());
++                    seastar::this_smp_shard_count(), client_conf.str(), server_conf.str());
+       if (client_conf.skip_core_0) {
+-        ceph_assert(seastar::smp::count > client_conf.num_clients);
++        ceph_assert(seastar::this_smp_shard_count() > client_conf.num_clients);
+       } else {
+-        ceph_assert(seastar::smp::count >= client_conf.num_clients);
++        ceph_assert(seastar::this_smp_shard_count() >= client_conf.num_clients);
+       }
+       ceph_assert(client_conf.num_clients > 0);
+-      ceph_assert(seastar::smp::count > server_conf.core + client_conf.num_clients);
++      ceph_assert(seastar::this_smp_shard_count() > server_conf.core + client_conf.num_clients);
+       return seastar::when_all_succeed(
+         // it is not reasonable to allow server/client to shared cores for
+         // performance benchmarking purposes.
+@@ -1139,11 +1139,11 @@ static seastar::future<> run(
+       });
+     } else if (mode == perf_mode_t::client) {
+       logger().info("\nperf settings:\n  smp={}\n  {}\n",
+-                    seastar::smp::count, client_conf.str());
++                    seastar::this_smp_shard_count(), client_conf.str());
+       if (client_conf.skip_core_0) {
+-        ceph_assert(seastar::smp::count > client_conf.num_clients);
++        ceph_assert(seastar::this_smp_shard_count() > client_conf.num_clients);
+       } else {
+-        ceph_assert(seastar::smp::count >= client_conf.num_clients);
++        ceph_assert(seastar::this_smp_shard_count() >= client_conf.num_clients);
+       }
+       ceph_assert(client_conf.num_clients > 0);
+       return client->init(
+@@ -1156,9 +1156,9 @@ static seastar::future<> run(
+         return client->shutdown();
+       });
+     } else { // mode == perf_mode_t::server
+-      ceph_assert(seastar::smp::count > server_conf.core);
++      ceph_assert(seastar::this_smp_shard_count() > server_conf.core);
+       logger().info("\nperf settings:\n  smp={}\n  {}\n",
+-                    seastar::smp::count, server_conf.str());
++                    seastar::this_smp_shard_count(), server_conf.str());
+       return seastar::async([server, server_conf] {
+         // FIXME: SIGINT is not received by stop_signal
+         seastar_apps_lib::stop_signal should_stop;
+diff --git a/src/crimson/tools/store_bench/store-bench.cc b/src/crimson/tools/store_bench/store-bench.cc
+index 18fe9af9d5f42..8993a94cc1a49 100644
+--- a/src/crimson/tools/store_bench/store-bench.cc
++++ b/src/crimson/tools/store_bench/store-bench.cc
+@@ -932,7 +932,7 @@ int main(int argc, char **argv) {
+             co_return results_t{};
+           }
+         };
+-        for (unsigned i = 0; i < seastar::smp::count; ++i) {
++        for (unsigned i = 0; i < seastar::this_smp_shard_count(); ++i) {
+           per_shard_futures.push_back(
+               seastar::smp::submit_to(i, std::move(named_lambda)));
+         }
+diff --git a/src/test/crimson/seastore/nvmedevice/test_nvmedevice.cc b/src/test/crimson/seastore/nvmedevice/test_nvmedevice.cc
+index 3ad41e29dc79d..4eb771c0b6ed5 100644
+--- a/src/test/crimson/seastore/nvmedevice/test_nvmedevice.cc
++++ b/src/test/crimson/seastore/nvmedevice/test_nvmedevice.cc
+@@ -58,7 +58,7 @@ TEST_F(nvdev_test_t, write_and_verify_test)
+   run_async([this] {
+     device.reset(new random_block_device::nvme::NVMeBlockDevice(dev_path));
+     local_conf().set_val("seastore_cbjournal_size", "1048576").get();
+-    device->start(seastar::smp::count).get();
++    device->start(seastar::this_smp_shard_count()).get();
+     device->mkfs(
+       device_config_t{
+ 	true,
+diff --git a/src/test/crimson/test_buffer.cc b/src/test/crimson/test_buffer.cc
+index 61b2785dd607a..a99ca1f360584 100644
+--- a/src/test/crimson/test_buffer.cc
++++ b/src/test/crimson/test_buffer.cc
+@@ -23,10 +23,10 @@ seastar::future<> test_foreign_bufferlist()
+     bl.claim_append(rhs);
+     return bl;
+   };
+-  return seastar::map_reduce(seastar::smp::all_cpus(), make_foreign_buffer,
++  return seastar::map_reduce(seastar::this_smp_all_shards(), make_foreign_buffer,
+                              bufferlist(), reduce).then(
+     [] (bufferlist&& bl) {
+-      if (bl.length() != 4 * seastar::smp::count) {
++      if (bl.length() != 4 * seastar::this_smp_shard_count()) {
+         auto e = std::make_exception_ptr(std::runtime_error("wrong buffer size"));
+         return seastar::make_exception_future<>(e);
+       }
+diff --git a/src/test/crimson/test_messenger.cc b/src/test/crimson/test_messenger.cc
+index e7d5069fa2ae1..9bee4dc6c35ba 100644
+--- a/src/test/crimson/test_messenger.cc
++++ b/src/test/crimson/test_messenger.cc
+@@ -3839,7 +3839,7 @@ seastar::future<int> do_test(seastar::app_template& app)
+                   verbose, rounds, keepalive_ratio,
+                   test_addr, cmd_peer_addr, test_peer_addr,
+                   testpeer_islocal, peer_wins,
+-                  seastar::smp::count);
++                  seastar::this_smp_shard_count());
+     return test_echo(rounds, keepalive_ratio
+     ).then([] {
+       return test_preemptive_shutdown();

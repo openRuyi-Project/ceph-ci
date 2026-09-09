@@ -1,0 +1,53 @@
+From dada074b3437b2696479496b93ab50f9da598662 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Fri, 29 May 2026 14:48:07 +0800
+Subject: [PATCH 1/2] monitoring/ceph-mixin: bump jsonnet-bundler to v0.6.0
+
+v0.4.0 fails to build on riscv64; bump to v0.6.0 to fix it.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ monitoring/ceph-mixin/jsonnet-bundler-build.sh | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/monitoring/ceph-mixin/jsonnet-bundler-build.sh b/monitoring/ceph-mixin/jsonnet-bundler-build.sh
+index d713cffb8bcc5..463658f186bfa 100755
+--- a/monitoring/ceph-mixin/jsonnet-bundler-build.sh
++++ b/monitoring/ceph-mixin/jsonnet-bundler-build.sh
+@@ -1,6 +1,6 @@
+ #!/bin/sh -ex
+ 
+-JSONNET_VERSION="v0.4.0"
++JSONNET_VERSION="v0.6.0"
+ OUTPUT_DIR=${1:-$(pwd)}
+ 
+ git clone -b ${JSONNET_VERSION} --depth 1 https://github.com/jsonnet-bundler/jsonnet-bundler
+
+From a764ecf720c536cec35095872e1db41b363104a3 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Sat, 20 Jun 2026 23:21:01 +0800
+Subject: [PATCH 2/2] monitoring/ceph-mixin: make jsonnet-bundler clone
+ idempotent
+
+A run that aborts before the cleanup fixture runs (timeout, OOM,
+interrupt) leaves the clone dir behind, so the next build fails with
+"destination path already exists". Remove it first.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ monitoring/ceph-mixin/jsonnet-bundler-build.sh | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/monitoring/ceph-mixin/jsonnet-bundler-build.sh b/monitoring/ceph-mixin/jsonnet-bundler-build.sh
+index 463658f186bfa..bb5b323500c9c 100755
+--- a/monitoring/ceph-mixin/jsonnet-bundler-build.sh
++++ b/monitoring/ceph-mixin/jsonnet-bundler-build.sh
+@@ -3,6 +3,8 @@
+ JSONNET_VERSION="v0.6.0"
+ OUTPUT_DIR=${1:-$(pwd)}
+ 
++# clean up leftovers from an aborted run so the clone stays idempotent
++rm -rf jsonnet-bundler
+ git clone -b ${JSONNET_VERSION} --depth 1 https://github.com/jsonnet-bundler/jsonnet-bundler
+ make -C jsonnet-bundler  build
+ mv jsonnet-bundler/_output/jb ${OUTPUT_DIR}
