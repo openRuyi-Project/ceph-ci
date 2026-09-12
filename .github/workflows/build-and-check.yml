@@ -1,0 +1,198 @@
+# build-check: build ceph main + run ctest inside an openRuyi container on a riscv64 self-hosted runner.
+name: build-and-check
+
+# Per-run title in the Actions list, e.g. "spec-openruyi · sg2044": each label matches
+# that CI's ${WORKDIR}/<bucket>/ subdir on the runner. openruyi_spec wins if both spec
+# toggles are ticked (see the step `if:` conditions).
+run-name: ${{ inputs.openruyi_spec && 'spec-openruyi' || (inputs.upstream_spec && 'spec-upstream' || (inputs.with_asan && 'build-check-asan' || 'build-check')) }} · ${{ inputs.runner || 'sg2044' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      # Site-specific: each option is a label on one of this site's self-hosted
+      # runners, and also picks the RVA23/RVA20 handling below.
+      runner:
+        description: "Which self-hosted board to run on"
+        type: choice
+        options:
+          - sg2044
+          - sg2042
+        default: sg2044
+      ceph_ref:
+        description: "ceph branch/tag/sha to test"
+        default: main
+      openruyi_spec:
+        description: "spec-openruyi CI: validate the openRuyi downstream spec (openruyi/) the way OBS does, minus OBS: rpmbuild openruyi/ceph.spec in the container (spec drives %prep/%build/%install), then run ctest on its build tree. Own path (scripts/openruyi/run-spec-build.sh), bucket ${WORKDIR}/spec-openruyi/: ignores ceph_ref/incremental, honors resume/files_only/skip_ctest/rebuild_deps (rebuild_deps refreshes its cached openruyi-deps image). Wins over upstream_spec if both ticked."
+        type: boolean
+        default: false
+      upstream_spec:
+        description: "spec-upstream CI: validate the UPSTREAM ceph.spec.in: upstream checkout @ ceph_ref (pristine, or with scripts/upstream-spec/*.patch applied+committed to test a patch bound for upstream), upstream make-dist turns ceph.spec.in into a real ceph.spec + Source0 tarball, then rpmbuild validates it and ctest runs on its build tree (the spec's %install deletes the cmake tree, so the build uses rpm short-circuit -- no spec edits). Own path (scripts/upstream-spec/run-spec-in-build.sh), bucket ${WORKDIR}/spec-upstream/: honors ceph_ref/resume/files_only/skip_ctest/rebuild_deps/make_dist_full. No-op if openruyi_spec is also ticked."
+        type: boolean
+        default: false
+      make_dist_full:
+        description: "spec-upstream ONLY: run vanilla make-dist incl. its dashboard-frontend npm build (heavy, riscv64-flaky). Default (unticked) skips it -- the spec's %build sets WITH_MGR_DASHBOARD_FRONTEND=OFF, so that output is unused. No-op on the other paths."
+        type: boolean
+        default: false
+      incremental:
+        description: "Reuse existing build/ (incremental; skips the full recompile)"
+        type: boolean
+        default: false
+      resume:
+        description: "Resume an interrupted build: skip clone/fetch/patch/configure, reuse the existing checkout + build/ as-is (implies incremental; ignores ceph_ref). For continuing an OOM-killed run. spec-openruyi path: rpmbuild --noprep, reuse the persisted BUILD/ tree (for spec-only / small source edits)."
+        type: boolean
+        default: false
+      files_only:
+        description: "SPEC PATHS ONLY (spec-openruyi / spec-upstream): re-check %files against the BUILDROOT a prior run left behind (rpmbuild -bl) -- seconds, no compile/install. For a %files mismatch on a version bump (renamed unit, moved file). Implies skip_ctest. No-op on the build-check path."
+        type: boolean
+        default: false
+      skip_ctest:
+        description: "SPEC PATHS ONLY (spec-openruyi / spec-upstream): stop once rpmbuild succeeds (packaging validated, rpms produced); skip the slow ctest. No-op on the build-check path."
+        type: boolean
+        default: false
+      rebuild_deps:
+        description: "Rebuild the deps image (reinstall BuildRequires; picks up openRuyi package updates)"
+        type: boolean
+        default: false
+      use_temp_obs:
+        description: "Prefer deps from the temporary OBS project (the CI_TEMP_OBS_PROJECT repository variable; untick = stock openRuyi repos only)"
+        type: boolean
+        default: true
+      offline:
+        description: "Skip the registry image pull; reuse the cached local image (use when the registry is down)"
+        type: boolean
+        default: false
+      with_asan:
+        description: "build-check path: build with AddressSanitizer (-DWITH_ASAN=ON) in a SEPARATE build-check-asan bucket (own checkout/build/sccache). Default off. No-op on the spec paths."
+        type: boolean
+        default: false
+
+# Per-board group: each board cancels only its own previous run, so sg2044 and
+# sg2042 can build in parallel.
+concurrency:
+  group: build-and-check-${{ inputs.runner || 'sg2044' }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux, riscv64, "${{ inputs.runner || 'sg2044' }}"]
+    timeout-minutes: 1440   # first cold build can take 6-10h on SG2044
+    env:
+      CEPH_REF: ${{ inputs.ceph_ref || 'main' }}
+      # build-check path: reuse the persisted build/ instead of rm -rf'ing it.
+      BUILD_INCREMENTAL: ${{ inputs.incremental && '1' || '' }}
+      # Skip clone/fetch/patch/configure and reuse the checkout + build/ as-is (implies
+      # BUILD_INCREMENTAL, ignores CEPH_REF). For continuing an OOM-killed build.
+      RESUME: ${{ inputs.resume && '1' || '' }}
+      # Spec paths only: re-run just the %files check (rpmbuild -bl) against the
+      # persisted BUILDROOT -- seconds, no compile/install. Implies SKIP_CTEST.
+      FILES_ONLY: ${{ inputs.files_only && '1' || '' }}
+      # Spec paths only: stop once rpmbuild succeeds, skip the slow ctest.
+      SKIP_CTEST: ${{ inputs.skip_ctest && '1' || '' }}
+      # spec-upstream only: run vanilla make-dist incl. its dashboard-frontend npm
+      # build (the spec builds the dashboard OFF, so unset skips it).
+      MAKE_DIST_FULL: ${{ inputs.make_dist_full && '1' || '' }}
+      # Refresh BuildRequires (picks up rolling openRuyi updates). build-check rebuilds
+      # the bwc build image; the spec paths refresh their deps image in place and
+      # re-commit only if the package set changed.
+      REBUILD_DEPS: ${{ inputs.rebuild_deps && '1' || '' }}
+      # Ticked (default): deps prefer the temporary OBS project (patch 2005,
+      # priority=1); toggling rebuilds the deps image via the image fingerprint.
+      # Forced 0 on sg2042: it is RVA20 and the temp project has no rva20 repo, so
+      # layering it would pull RVA23 pkgs that SIGILL.
+      TEMP_OBS_REPO: ${{ inputs.runner == 'sg2042' && '0' || (inputs.use_temp_obs && '1' || '0') }}
+      # Which OBS project that is: site-specific, so a repository variable rather than
+      # a default in the tree. Unset with TEMP_OBS_REPO=1 is an error the driver reports.
+      TEMP_OBS_PROJECT: ${{ vars.CI_TEMP_OBS_PROJECT }}
+      # Proxy this site reaches github through. Unset = the runner has direct external
+      # network and no probe is attempted.
+      CI_PROXY_PROBE: ${{ vars.CI_PROXY_PROBE }}
+      # Reuse the existing local image instead of pulling (registry down / 502).
+      OFFLINE: ${{ inputs.offline && '1' || '0' }}
+      # build-check path only: -DWITH_ASAN=ON in the separate build-check-asan bucket.
+      WITH_ASAN: ${{ inputs.with_asan && '1' || '' }}
+      # GIT_PROXY left UNSET so the script auto-probes CI_PROXY_PROBE; defining it
+      # (even to "" via an absent secret) skips the probe -> direct.
+      # WORKDIR is a fixed path outside the runner's workspace (github-act-runner wipes
+      # ~/.cache/act/<hash> after each job) so the ceph clone and ci-log archive persist.
+      # Site-specific: set the CI_WORKDIR repository variable to a path on the runner.
+      WORKDIR: ${{ vars.CI_WORKDIR }}
+    steps:
+      - name: Checkout ceph-ci
+        uses: actions/checkout@v4
+
+      # Fail here rather than letting the drivers default WORKDIR to the checkout's
+      # parent, which the runner wipes between jobs.
+      - name: Check site configuration
+        run: |
+          if [ -z "$WORKDIR" ]; then
+            echo "::error::CI_WORKDIR repository variable is not set."
+            echo "Set it under Settings > Secrets and variables > Actions > Variables"
+            echo "to a persistent path on the runner, e.g. /var/lib/ceph-ci."
+            exit 1
+          fi
+
+      # Default path: neither spec toggle ticked -> build-check build + ctest of patched upstream.
+      - name: Run build-check (build + ctest) in openRuyi container
+        if: ${{ !inputs.openruyi_spec && !inputs.upstream_spec }}
+        run: ./scripts/run-build-check.sh
+
+      # openruyi_spec ticked: validate the downstream spec via rpmbuild instead.
+      # Takes precedence over upstream_spec if both are ticked.
+      - name: Validate openRuyi spec (rpmbuild + ctest) in openRuyi container
+        if: ${{ inputs.openruyi_spec }}
+        run: ./scripts/openruyi/run-spec-build.sh
+
+      # upstream_spec ticked (and not openruyi_spec): make-dist generates the spec +
+      # Source0 from ceph.spec.in, then rpmbuild + ctest.
+      - name: Validate upstream ceph.spec.in (make-dist + rpmbuild + ctest) in openRuyi container
+        if: ${{ inputs.upstream_spec && !inputs.openruyi_spec }}
+        run: ./scripts/upstream-spec/run-spec-in-build.sh
+
+      # Copy the wanted files out of WORKDIR into the checkout, where upload-artifact
+      # can pick them up via a relative path. Each step is gated on the path that ran.
+      - name: Stage artifacts (build-check)
+        if: ${{ always() && !inputs.openruyi_spec && !inputs.upstream_spec }}
+        run: |
+          mkdir -p artifacts
+          # Same bucket the build wrote to: build-check, or build-check-asan when WITH_ASAN.
+          BUCKET="build-check${{ inputs.with_asan && '-asan' || '' }}"
+          cp -L "$WORKDIR/$BUCKET/run.log" artifacts/ 2>/dev/null || true
+          cp "$WORKDIR/$BUCKET"/ceph/build/Testing/Temporary/LastTest.log* artifacts/ 2>/dev/null || true
+          cp "$WORKDIR/$BUCKET"/ceph/build/CMakeCache.txt artifacts/ 2>/dev/null || true
+          cp "$WORKDIR/$BUCKET"/ceph/build/core* artifacts/ 2>/dev/null || true
+
+      - name: Stage artifacts (spec-openruyi)
+        if: ${{ always() && inputs.openruyi_spec }}
+        run: |
+          mkdir -p artifacts
+          cp -L "$WORKDIR/spec-openruyi/run.log" artifacts/ 2>/dev/null || true
+          cp -r "$WORKDIR"/spec-openruyi/artifacts/Testing/Temporary/LastTest.log* artifacts/ 2>/dev/null || true
+          cp "$WORKDIR"/spec-openruyi/artifacts/CMakeCache.txt artifacts/ 2>/dev/null || true
+          # Built rpms EXCEPT the multi-GB *-debuginfo/*-debugsource (ceph-debuginfo
+          # alone is ~5.6G): uploading those stalls the job for hours. They stay on
+          # the CI host under spec-openruyi/rpms/.
+          find "$WORKDIR"/spec-openruyi/rpms -name '*.rpm' \
+            ! -name '*-debuginfo-*' ! -name '*-debugsource-*' \
+            -exec cp {} artifacts/ \; 2>/dev/null || true
+
+      - name: Stage artifacts (spec-upstream)
+        if: ${{ always() && inputs.upstream_spec && !inputs.openruyi_spec }}
+        run: |
+          mkdir -p artifacts
+          cp -L "$WORKDIR/spec-upstream/run.log" artifacts/ 2>/dev/null || true
+          cp -r "$WORKDIR"/spec-upstream/artifacts/Testing/Temporary/LastTest.log* artifacts/ 2>/dev/null || true
+          cp "$WORKDIR"/spec-upstream/artifacts/CMakeCache.txt artifacts/ 2>/dev/null || true
+          # Built rpms (only present in skip_ctest mode) EXCEPT the multi-GB
+          # *-debuginfo/*-debugsource -- same reason as the spec-openruyi path.
+          find "$WORKDIR"/spec-upstream/rpms -name '*.rpm' \
+            ! -name '*-debuginfo-*' ! -name '*-debugsource-*' \
+            -exec cp {} artifacts/ \; 2>/dev/null || true
+
+      - name: Collect logs + artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # distinct names so each path's artifacts aren't mislabeled as another's
+          name: ${{ inputs.openruyi_spec && 'spec-openruyi-artifacts' || (inputs.upstream_spec && 'spec-upstream-artifacts' || (inputs.with_asan && 'build-check-asan-artifacts' || 'build-check-artifacts')) }}
+          if-no-files-found: ignore
+          path: artifacts/
