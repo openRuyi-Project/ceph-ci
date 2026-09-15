@@ -76,15 +76,12 @@ TREE_PATCHES=(
     # https://github.com/ceph/ceph/pull/70211
     1140-src-common-optimize-Zvbc-CRC32C-for-riscv64.patch
 
-    # todo
-    1142-test-common-run-unittest_throttle-serially.patch
+    # https://github.com/ceph/ceph/pull/70463
     1143-test-mds-run-unittest_mds_quiesce_db-serially.patch
 
     # https://github.com/ceph/ceph/pull/71249
     1144-cmake-boost-don-t-pass-context-impl-to-the-headers-s.patch
 
-    # https://github.com/ceph/ceph/pull/71759
-    1145-cmake-link-rgw-crimson-and-ceph-osd-in-the-heavy-job.patch
     # https://github.com/ceph/ceph/pull/71460
     1045-qa-lsan.supp-match-OpenSSL-error-state-on-ERR_set_ma.patch
 
