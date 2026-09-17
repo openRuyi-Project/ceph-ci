@@ -137,3 +137,32 @@ spec_build_run() {
     RC=$?
     set -e
 }
+
+# spec_install_check STAMP: dnf-install the rpms written after STAMP into a fresh
+# container FROM the base image, like openRuyi's PR CI does after its build. No
+# BuildRequires are present there, so a missing or wrong runtime Requires, a file
+# conflict or a failing scriptlet shows up. Stock repos only; *-debuginfo and
+# *-debugsource are left out. Needs INSTALL_CONTAINER, PROXY_ENV. Sets INSTALL_RC.
+spec_install_check() {
+    local stamp="$1" rpm
+    local -a rpms=()
+    while IFS= read -r rpm; do
+        rpms+=("/rpms/${rpm#"${RPMS_OUT}"/}")
+    done < <(find "${RPMS_OUT}" -name '*.rpm' ! -name '*.src.rpm' \
+                 ! -name '*-debuginfo-*' ! -name '*-debugsource-*' \
+                 -newer "${stamp}" | sort)
+    if [ "${#rpms[@]}" = 0 ]; then
+        echo "ERROR: no rpms from this run under ${RPMS_OUT}" >&2
+        INSTALL_RC=1
+        return 0
+    fi
+    echo "=== install check: dnf install ${#rpms[@]} rpms into a clean ${CI_BASE_IMAGE} container ==="
+    set +e
+    "${ENGINE}" run --rm --name "${INSTALL_CONTAINER}" \
+        "${PROXY_ENV[@]}" \
+        -v "${RPMS_OUT}:/rpms:ro,Z" \
+        "${CI_BASE_IMAGE}" \
+        bash -ec 'set -x; dnf update -y; dnf install -y "$@"' _ "${rpms[@]}"
+    INSTALL_RC=$?
+    set -e
+}

@@ -2,8 +2,9 @@
 #
 # spec-openruyi driver: validate the openRuyi downstream ceph spec (openruyi/) the way
 # OBS does, minus OBS. rpmbuild runs in the openRuyi container (the container half is
-# spec-build-in-container.sh), then our ctest runs on the spec's own build tree. This
-# side sets up the image, proxy, persistent caches and ctest options.
+# spec-build-in-container.sh), then our ctest runs on the spec's own build tree, then
+# the rpms are dnf-installed into a clean base-image container. This side sets up the
+# image, proxy, persistent caches and ctest options.
 #
 # %prep is the spec's own (submodule tarballs, isa-l swap, %autopatch), and the build
 # is its real downstream config (WITH_CRIMSON=OFF, RelWithDebInfo, no ASan).
@@ -62,6 +63,7 @@ CTEST_JOBS="${CTEST_JOBS:-$(nproc)}"
 DEPS_IMAGE="localhost/openruyi-deps:riscv64"
 BUILD_CONTAINER="ceph_openruyi_build"
 DEPS_CONTAINER="openruyi_deps_build"
+INSTALL_CONTAINER="ceph_openruyi_install"
 SPEC_CONTAINER_SCRIPT="${REPO_ROOT}/scripts/openruyi/spec-build-in-container.sh"
 
 # Off unless the site configures a project (TEMP_OBS_PROJECT).
@@ -76,7 +78,7 @@ ci_bool SKIP_CTEST 0
     echo "ERROR: ${OPENRUYI_DIR}/ceph.spec not found" >&2; exit 1; }
 ci_require_riscv64
 ci_open_run_log
-ci_trap_cleanup "${BUILD_CONTAINER}" "${DEPS_CONTAINER}"
+ci_trap_cleanup "${BUILD_CONTAINER}" "${DEPS_CONTAINER}" "${INSTALL_CONTAINER}"
 # spectool fetches Source0..33 from github.com and archives.boost.io; podman forwards
 # *_proxy into the container.
 ci_resolve_proxy
@@ -114,9 +116,22 @@ spec_deps_fingerprint "${OPENRUYI_DIR}/ceph.spec"
 spec_deps_image_ensure -v "${OPENRUYI_DIR}:/spec:ro"
 
 # 2. rpmbuild + ctest in the container
+RPMBUILD_STAMP="${BASE}/.rpmbuild-start"
+touch "${RPMBUILD_STAMP}"
+rm -f "${ARTIFACTS}/.rpmbuild-ok"
 ci_mem_sampler_start
 spec_build_run -v "${OPENRUYI_DIR}:/spec:ro"
 ci_mem_sampler_stop
+
+# 3. dnf install the rpms into a clean base container. Only when rpmbuild finished;
+# FILES_ONLY builds no rpms.
+if [ -f "${ARTIFACTS}/.rpmbuild-ok" ]; then
+    spec_install_check "${RPMBUILD_STAMP}"
+    echo "=== install check done: rc=${INSTALL_RC} ==="
+    [ "${RC}" = 0 ] && RC="${INSTALL_RC}"
+else
+    echo "=== install check skipped: no rpms from this run ==="
+fi
 
 echo "=== spec validation done: rc=${RC} ==="
 echo "  rpms:      ${RPMS_OUT}"

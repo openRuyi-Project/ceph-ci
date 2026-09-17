@@ -12,7 +12,8 @@
 #   PHASE=build (default, FROM the deps image): stage openruyi/ into ~/rpmbuild,
 #               rpmdev-spectool the Source tarballs, rpmbuild -bb --nocheck --with
 #               make_check, then run ctest on the spec's build tree with the
-#               build-check tuning (the spec's own %check is a bare ctest).
+#               build-check tuning (the spec's own %check is a bare ctest). The
+#               host then dnf-installs the rpms (spec_install_check).
 #
 # %prep is the spec's own (submodule tarballs, isa-l swap, %autopatch), and the build
 # is its real downstream config (WITH_CRIMSON=OFF, RelWithDebInfo, no ASan).
@@ -100,6 +101,8 @@ echo "=== build phase: rpmbuild -bb --nocheck --noclean ${PREP_OPT} --with make_
 rpmbuild -bb --nocheck --noclean ${PREP_OPT} --with make_check \
     --define "_smp_build_ncpus ${NPROC:-$(nproc)}" \
     "${RB}/SPECS/ceph.spec"
+# Tells the host the rpms are complete, for its install check.
+touch /out/.rpmbuild-ok
 
 if [ "${SKIP_CTEST:-0}" = 1 ]; then
     sccache_stats

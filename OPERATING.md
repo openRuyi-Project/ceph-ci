@@ -9,11 +9,11 @@
 | `scripts/lib/image.sh` | the openRuyi base image: its local tag (`CI_BASE_IMAGE`, read by the fetch scripts and the spec drivers) and the probe that picks the build (riscv64 / rva20) matching the host's RISC-V profile |
 | `scripts/lib/site.sh` | the site settings shared by the three drivers: temporary OBS project, proxy probe, no-proxy list. The first two have no default and come from the environment (see README, *Site configuration*) |
 | `scripts/lib/common.sh` | helpers shared by the three drivers: arch check, run.log setup, signal cleanup, the git network config + ceph checkout, ctest options from `known-failures.json`, memory sampler |
-| `scripts/lib/spec-host.sh` | host-side helpers shared by the two spec drivers: persistent dirs, deps-image reuse/refresh/rebuild, the build container run |
+| `scripts/lib/spec-host.sh` | host-side helpers shared by the two spec drivers: persistent dirs, deps-image reuse/refresh/rebuild, the build container run, the rpm install check |
 | `scripts/lib/spec-container.sh` | container-side helpers shared by the two spec container halves (mounted at `/spec-lib.sh`): tooling install, temp repo, builddep, sccache, ctest on the spec's build tree |
 | `scripts/run-build-check.sh` | **build-check** driver (upstream main): clone ceph @ ref, apply fork patches, run `build-with-container.py --distro openruyi -e tests`; bucket `${WORKDIR}/build-check/` |
 | `scripts/openruyi/run-spec-build.sh` | **spec-openruyi** driver (`openruyi_spec` option): host side -- image, proxy, caches, ctest options -- then launch the container half; bucket `${WORKDIR}/spec-openruyi/` |
-| `scripts/openruyi/spec-build-in-container.sh` | container half: `rpmdev-spectool -g` + `dnf builddep` + `rpmbuild -bb --nocheck --with make_check` on `openruyi/ceph.spec`, then build-check-style ctest on the spec's build tree |
+| `scripts/openruyi/spec-build-in-container.sh` | container half: `rpmdev-spectool -g` + `dnf builddep` + `rpmbuild -bb --nocheck --with make_check` on `openruyi/ceph.spec`, then build-check-style ctest on the spec's build tree; the driver then `dnf install`s the rpms into a clean base-image container |
 | `openruyi/` | the openRuyi downstream `ceph.spec` + its `%patchlist`/source patches (validated by `run-spec-build.sh`) |
 | `scripts/upstream-spec/run-spec-in-build.sh` | **spec-upstream** driver: validate the UPSTREAM `ceph.spec.in`: upstream checkout (pristine, or with `scripts/upstream-spec/*.patch` applied+committed to test a patch bound for upstream), host side (image, proxy, caches, ctest), then the container half; bucket `${WORKDIR}/spec-upstream/` |
 | `scripts/upstream-spec/*.patch` | optional patches applied onto the upstream checkout before make-dist (e.g. one you're preparing to submit upstream); none present = a clean upstream build |
@@ -62,7 +62,9 @@ CEPH_REF=main ./scripts/run-build-check.sh
 Validate the openRuyi downstream spec instead of upstream main (`rpmbuild` of
 `openruyi/ceph.spec` in the container -- spec drives `%prep`/`%build`/`%install`,
 no fork-patches -- then ctest on its build tree, with the spec's own downstream
-config: `WITH_CRIMSON=OFF`, RelWithDebInfo, no ASan):
+config: `WITH_CRIMSON=OFF`, RelWithDebInfo, no ASan; finally the rpms, minus
+*-debuginfo/*-debugsource, are `dnf install`ed into a clean base-image container
+against the stock repos):
 
 ```bash
 ./scripts/openruyi/run-spec-build.sh

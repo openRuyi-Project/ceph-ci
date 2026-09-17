@@ -46,7 +46,7 @@ checkouts and caches never interleave:
 | CI | what it does | driver | bucket |
 |----|--------------|--------|--------|
 | **build-check** | clone ceph + apply fork-patches + build + ctest (the PR-style job) | `scripts/run-build-check.sh` | `${WORKDIR}/build-check/` |
-| **spec-openruyi** | rpmbuild the **downstream** `openruyi/ceph.spec` + ctest | `scripts/openruyi/run-spec-build.sh` | `${WORKDIR}/spec-openruyi/` |
+| **spec-openruyi** | rpmbuild the **downstream** `openruyi/ceph.spec` + ctest + dnf install the rpms | `scripts/openruyi/run-spec-build.sh` | `${WORKDIR}/spec-openruyi/` |
 | **spec-upstream** | make-dist the **upstream** `ceph.spec.in` → rpmbuild + ctest | `scripts/upstream-spec/run-spec-in-build.sh` | `${WORKDIR}/spec-upstream/` |
 
 Inside every bucket the same names recur: `run.log` (symlink to the newest run),

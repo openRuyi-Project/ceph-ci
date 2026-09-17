@@ -22,7 +22,7 @@ on:
         description: "ceph branch/tag/sha to test"
         default: main
       openruyi_spec:
-        description: "spec-openruyi CI: validate the openRuyi downstream spec (openruyi/) the way OBS does, minus OBS: rpmbuild openruyi/ceph.spec in the container (spec drives %prep/%build/%install), then run ctest on its build tree. Own path (scripts/openruyi/run-spec-build.sh), bucket ${WORKDIR}/spec-openruyi/: ignores ceph_ref/incremental, honors resume/files_only/skip_ctest/rebuild_deps (rebuild_deps refreshes its cached openruyi-deps image). Wins over upstream_spec if both ticked."
+        description: "spec-openruyi CI: validate the openRuyi downstream spec (openruyi/) the way OBS does, minus OBS: rpmbuild openruyi/ceph.spec in the container (spec drives %prep/%build/%install), then run ctest on its build tree, then dnf install the rpms into a clean base-image container (stock repos). Own path (scripts/openruyi/run-spec-build.sh), bucket ${WORKDIR}/spec-openruyi/: ignores ceph_ref/incremental, honors resume/files_only/skip_ctest/rebuild_deps (rebuild_deps refreshes its cached openruyi-deps image). Wins over upstream_spec if both ticked."
         type: boolean
         default: false
       upstream_spec:
@@ -138,7 +138,7 @@ jobs:
 
       # openruyi_spec ticked: validate the downstream spec via rpmbuild instead.
       # Takes precedence over upstream_spec if both are ticked.
-      - name: Validate openRuyi spec (rpmbuild + ctest) in openRuyi container
+      - name: Validate openRuyi spec (rpmbuild + ctest + dnf install) in openRuyi container
         if: ${{ inputs.openruyi_spec }}
         run: ./scripts/openruyi/run-spec-build.sh
 
