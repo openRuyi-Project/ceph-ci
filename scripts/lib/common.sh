@@ -52,8 +52,10 @@ ci_git_net_args() {
 # ci_submodule_sync DIR: check the submodule worktrees out to the index gitlinks.
 # --force re-checks out incomplete worktrees; -c http.proxy reaches child clones via
 # GIT_CONFIG_PARAMETERS. Re-run after a patch bumps a gitlink -- git apply rewrites
-# only the index entry.
+# only the index entry. `submodule sync` first: a patch may also point .gitmodules
+# at a fork, and update fetches from the URL recorded in .git/config at init time.
 ci_submodule_sync() {
+    git -C "$1" submodule sync --recursive >/dev/null
     git -C "$1" "${GIT_NET_ARGS[@]}" submodule update --init --force --recursive ${CI_PROXY:+--jobs 4}
 }
 
