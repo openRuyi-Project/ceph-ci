@@ -1,0 +1,56 @@
+From 0df8155222e55532eb93c7a1d9b8544c8ad2b444 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Thu, 17 Sep 2026 23:17:05 -0700
+Subject: [PATCH] build: default WITH_RADOSGW_LANCEDB off where lance cannot
+ build
+
+lance-linalg only implements its SIMD types for x86_64, aarch64 and
+loongarch64, so lancedb fails to compile anywhere else (riscv64, s390x,
+ppc64le). Default the cmake option and the spec bcond off on those
+architectures instead of failing the build.
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ CMakeLists.txt | 9 ++++++++-
+ ceph.spec.in   | 4 ++++
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 09bb41b90b0..10453ce3d5c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -602,7 +602,14 @@ option(WITH_RADOSGW_RADOS "RADOS backend for Rados Gateway" ON)
+ option(WITH_RADOSGW_SELECT_PARQUET "Support for s3 select on parquet objects" ON)
+ option(WITH_RADOSGW_ARROW_FLIGHT "Build arrow flight when not using system-provided arrow" OFF)
+ option(WITH_RADOSGW_BACKTRACE_LOGGING "Enable backtraces in rgw logs" OFF)
+-option(WITH_RADOSGW_LANCEDB "Enable lancedb support in RADOS Gateway" ON)
++# lance ships SIMD kernels for x86_64, aarch64 and loongarch64 only and does
++# not compile on other architectures
++if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|aarch64|arm64|ARM64|loongarch64)$")
++  set(WITH_RADOSGW_LANCEDB_DEFAULT ON)
++else()
++  set(WITH_RADOSGW_LANCEDB_DEFAULT OFF)
++endif()
++option(WITH_RADOSGW_LANCEDB "Enable lancedb support in RADOS Gateway" ${WITH_RADOSGW_LANCEDB_DEFAULT})
+ 
+ option(WITH_SYSTEM_ARROW "Use system-provided arrow" OFF)
+ option(WITH_SYSTEM_UTF8PROC "Use system-provided utf8proc" OFF)
+diff --git a/ceph.spec.in b/ceph.spec.in
+index f723b156707..c080e46c741 100644
+--- a/ceph.spec.in
++++ b/ceph.spec.in
+@@ -54,7 +54,11 @@
+ %bcond_without lttng
+ %bcond_without libradosstriper
+ %bcond_without ocf
++%ifarch x86_64 aarch64 loongarch64
+ %bcond_without lancedb
++%else
++%bcond_with lancedb
++%endif
+ %global luarocks_package_name luarocks
+ %bcond_without lua_packages
+ %global _remote_tarball_prefix https://download.ceph.com/tarballs/
+-- 
+2.55.0
+

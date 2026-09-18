@@ -86,8 +86,11 @@ TREE_PATCHES=(
     # https://github.com/ceph/ceph/pull/71460
     1045-qa-lsan.supp-match-OpenSSL-error-state-on-ERR_set_ma.patch
 
-    # lancedb-c bump lives on the sunyuechi/lancedb-c fork until upstream takes it
-    1147-rgw-lancedb-bump-lancedb-to-0.39.0-lance-12.patch
+    # lancedb-c bump lives on the sunyuechi/lancedb-c fork until upstream takes it;
+    # off until lance-linalg builds on riscv64 (1148 disables lancedb there)
+    # 1147-rgw-lancedb-bump-lancedb-to-0.39.0-lance-12.patch
+
+    1148-build-default-WITH_RADOSGW_LANCEDB-off-where-lance-c.patch
 
     # -- 2xxx: openRuyi downstream, not for upstream --
     # bump pylint 2.6.0 -> 2.17.7 for py3.13 / wrapt compat
