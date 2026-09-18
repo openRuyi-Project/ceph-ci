@@ -106,6 +106,9 @@ jobs:
       # Proxy this site reaches github through. Unset = the runner has direct external
       # network and no probe is attempted.
       CI_PROXY_PROBE: ${{ vars.CI_PROXY_PROBE }}
+      # Authenticates the github fetches, which are otherwise rate-limited per IP.
+      # A machine-account token with no scopes; unset = anonymous, as before.
+      GITHUB_TOKEN: ${{ secrets.CI_GITHUB_TOKEN }}
       # Reuse the existing local image instead of pulling (registry down / 502).
       OFFLINE: ${{ inputs.offline && '1' || '0' }}
       # build-check path only: -DWITH_ASAN=ON in the separate build-check-asan bucket.

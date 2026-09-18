@@ -96,6 +96,24 @@ By default `make-dist`'s dashboard-frontend npm build is skipped: the spec's `%b
 sets `WITH_MGR_DASHBOARD_FRONTEND=OFF`, so that (heavy, riscv64-flaky) output is never
 used by `rpmbuild`. `MAKE_DIST_FULL=1` runs make-dist verbatim.
 
+## Github token
+
+Github rate-limits anonymous fetches per source IP; on a shared exit that surfaces as
+`could not read Username for 'https://github.com'`. A token moves the CI onto its own
+quota. It needs no scopes -- everything fetched is public -- and should belong to a
+machine account, not a person.
+
+```bash
+gh secret set CI_GITHUB_TOKEN                 # workflow runs
+printf '%s\n' '<token>' > ~/.ceph-ci/github-token && chmod 600 ~/.ceph-ci/github-token
+                                              # runs started by hand (CI_GITHUB_TOKEN_FILE)
+```
+
+Neither present: fetches stay anonymous, as before. The value never reaches a command
+line; `run.log` records only the verdict of the start-up check, which aborts the run on
+a token github rejects -- git itself presents the token only once github 401s, so a
+wrong one would otherwise stay invisible until the CI was already failing.
+
 ## ctest tuning (known-failures.json)
 
 ctest options are assembled by `ci_ctest_makeopts` (`scripts/lib/common.sh`) from

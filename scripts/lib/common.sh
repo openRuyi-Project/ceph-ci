@@ -32,10 +32,59 @@ ci_require_riscv64() {
     fi
 }
 
+# Token file for runs started by hand; the workflow passes GITHUB_TOKEN in the env.
+CI_GITHUB_TOKEN_FILE="${CI_GITHUB_TOKEN_FILE:-${HOME}/.ceph-ci/github-token}"
+# Names the variable, never the token, so it is safe in a config value.
+CI_GIT_CRED_HELPER='!f() { echo "username=x-access-token"; echo "password=$GITHUB_TOKEN"; }; f'
+
+# ci_github_token: export GITHUB_TOKEN, from the env or CI_GITHUB_TOKEN_FILE. Empty is
+# unset, not exported: callers key off presence, and an empty token authenticates as a
+# hard 401.
+ci_github_token() {
+    if [ -z "${GITHUB_TOKEN:-}" ] && [ -r "${CI_GITHUB_TOKEN_FILE}" ]; then
+        GITHUB_TOKEN="$(tr -d '[:space:]' < "${CI_GITHUB_TOKEN_FILE}")"
+    fi
+    if [ -z "${GITHUB_TOKEN:-}" ]; then
+        unset GITHUB_TOKEN
+        echo "  github token: none (anonymous fetches)"
+        return 0
+    fi
+    export GITHUB_TOKEN
+    # git only presents the token once github 401s, so a wrong one stays invisible
+    # until the CI is already failing. Check it here instead. An unreachable api is a
+    # warning, a rejected token is fatal. Needs CI_PROXY.
+    local body code limit
+    body="$(curl -sS ${CI_PROXY:+-x "${CI_PROXY}"} -m 20 -w '\n%{http_code}' \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            https://api.github.com/rate_limit 2>/dev/null || true)"
+    code="${body##*$'\n'}"
+    case "${code}" in
+        200)
+            limit="$(printf '%s' "${body%$'\n'*}" | python3 -c \
+                     'import json,sys; print(json.load(sys.stdin)["resources"]["core"]["limit"])' 2>/dev/null || true)"
+            if [ "${limit:-60}" -le 60 ] 2>/dev/null; then
+                echo "ERROR: the github token is accepted but still gets the anonymous quota (${limit}/h)." >&2
+                exit 1
+            fi
+            echo "  github token: valid (${limit}/h)"
+            ;;
+        401|403)
+            echo "ERROR: github rejected the token (HTTP ${code}). Replace the CI_GITHUB_TOKEN secret" >&2
+            echo "       or ${CI_GITHUB_TOKEN_FILE}; an expired or mistyped token fails every fetch" >&2
+            echo "       the moment github throttles." >&2
+            exit 1
+            ;;
+        *)
+            echo "  github token: present, unverified (api.github.com answered '${code}')"
+            ;;
+    esac
+}
+
 # ci_git_net_args: GIT_NET_ARGS, the command-level git config every network call
 # takes -- pinned proxy (empty = none), low-speed guard, and GIT_TERMINAL_PROMPT=0 so
 # a throttled github 401 fails with "could not read Username" (the signature
-# run-build-check.sh retries on) instead of prompting. Needs CI_PROXY.
+# run-build-check.sh retries on) instead of prompting, plus the github credential
+# helper when there is a token. Needs CI_PROXY.
 ci_git_net_args() {
     GIT_NET_ARGS=(
         -c "http.lowSpeedLimit=${GIT_LOW_SPEED_LIMIT}"
@@ -45,6 +94,9 @@ ci_git_net_args() {
         GIT_NET_ARGS+=(-c "http.proxy=${CI_PROXY}" -c "https.proxy=${CI_PROXY}")
     else
         GIT_NET_ARGS+=(-c "http.proxy=" -c "https.proxy=")
+    fi
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        GIT_NET_ARGS+=(-c "credential.https://github.com.helper=${CI_GIT_CRED_HELPER}")
     fi
     export GIT_TERMINAL_PROMPT=0
 }
@@ -157,6 +209,21 @@ ci_container_proxy_env() {
     if [ -n "${CI_PROXY}" ]; then
         PROXY_ENV=(-e "http_proxy=${CI_PROXY}" -e "https_proxy=${CI_PROXY}" -e "no_proxy=${CI_NO_PROXY}")
     fi
+}
+
+# ci_container_git_env: GIT_ENV, the -e flags giving a container's git the host's
+# github credentials (empty without a token). The bare `-e GITHUB_TOKEN` has the engine
+# read the value from its own env, keeping it off the command line. Only for the paths
+# that run the engine directly; build-with-container.py does this itself.
+ci_container_git_env() {
+    GIT_ENV=()
+    [ -n "${GITHUB_TOKEN:-}" ] || return 0
+    GIT_ENV=(
+        -e GITHUB_TOKEN
+        -e "GIT_CONFIG_COUNT=1"
+        -e "GIT_CONFIG_KEY_0=credential.https://github.com.helper"
+        -e "GIT_CONFIG_VALUE_0=${CI_GIT_CRED_HELPER}"
+    )
 }
 
 # ci_ctest_makeopts: CHECK_MAKEOPTS, the ctest options every path forwards:

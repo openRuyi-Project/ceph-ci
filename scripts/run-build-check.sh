@@ -195,6 +195,7 @@ ci_trap_cleanup "${BUILD_CONTAINER}" "${NETFAIL_CONTAINER}"
 # GIT_PROXY: explicit value wins; unset -> probe the proxy (scripts/lib/site.sh).
 ci_resolve_proxy
 GIT_PROXY="${CI_PROXY}"
+ci_github_token
 
 ci_require_riscv64
 
@@ -391,13 +392,22 @@ declare -a GIT_CFG_ARGS=(
     --extra="-eGIT_CONFIG_VALUE_2=${GIT_LOW_SPEED_TIME}"
 )
 _git_cfg_count=3
+# bwc forwards the token itself but writes its helper at index 0, which this
+# GIT_CONFIG_COUNT would drop; carry the same entry instead.
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+    GIT_CFG_ARGS+=(
+        --extra="-eGIT_CONFIG_KEY_${_git_cfg_count}=credential.https://github.com.helper"
+        --extra="-eGIT_CONFIG_VALUE_${_git_cfg_count}=${CI_GIT_CRED_HELPER}"
+    )
+    _git_cfg_count=$((_git_cfg_count + 1))
+fi
 if [ -n "${GIT_PROXY}" ]; then
     GIT_CFG_ARGS+=(
-        --extra="-eGIT_CONFIG_KEY_3=http.https://github.com/.proxy"
-        --extra="-eGIT_CONFIG_VALUE_3=${GIT_PROXY}"
+        --extra="-eGIT_CONFIG_KEY_${_git_cfg_count}=http.https://github.com/.proxy"
+        --extra="-eGIT_CONFIG_VALUE_${_git_cfg_count}=${GIT_PROXY}"
         --extra="-eGOPROXY=https://goproxy.cn,direct"   # openRuyi go defaults to GOPROXY=""
     )
-    _git_cfg_count=4
+    _git_cfg_count=$((_git_cfg_count + 1))
 fi
 GIT_CFG_ARGS+=(--extra="-eGIT_CONFIG_COUNT=${_git_cfg_count}")
 # In-container git HTTP tracing, off by default: ~150 log lines per fetch even on a
@@ -458,16 +468,26 @@ _capture_netfail_diag() {
     local diag
     diag="${BASE}/ci-log/$(basename "${RUN_LOG}" -run.log)-netfail-${label// /-}.log"
     echo "  capturing fetch diagnostics -> ${diag}"
-    # An empty GIT_PROXY must drop the -e flags entirely, not pass empty args.
+    # An empty GIT_PROXY must drop the -e flags entirely, not pass empty args. The
+    # token goes in too, or this measures a different path than the one that failed.
     local -a proxy_env=() proxy_cfg=()
+    local n=0 tok=none
     if [ -n "${GIT_PROXY}" ]; then
         proxy_env=(-ehttp_proxy="${GIT_PROXY}" -ehttps_proxy="${GIT_PROXY}")
-        proxy_cfg=(-eGIT_CONFIG_COUNT=1
-                   -eGIT_CONFIG_KEY_0=http.https://github.com/.proxy
-                   -eGIT_CONFIG_VALUE_0="${GIT_PROXY}")
+        proxy_cfg+=("-eGIT_CONFIG_KEY_${n}=http.https://github.com/.proxy"
+                    "-eGIT_CONFIG_VALUE_${n}=${GIT_PROXY}")
+        n=$((n + 1))
     fi
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        tok=present
+        proxy_env+=(-eGITHUB_TOKEN)
+        proxy_cfg+=("-eGIT_CONFIG_KEY_${n}=credential.https://github.com.helper"
+                    "-eGIT_CONFIG_VALUE_${n}=${CI_GIT_CRED_HELPER}")
+        n=$((n + 1))
+    fi
+    [ "${n}" -gt 0 ] && proxy_cfg+=("-eGIT_CONFIG_COUNT=${n}")
     {
-        echo "== ${label} hit a throttled fetch at $(date '+%F %T'), proxy=${GIT_PROXY} =="
+        echo "== ${label} hit a throttled fetch at $(date '+%F %T'), proxy=${GIT_PROXY} token=${tok} =="
         # shellcheck disable=SC2016  # NET_PROBE_* expand in the container's shell
         "${ENGINE}" run --rm --name="${NETFAIL_CONTAINER}" \
             "${proxy_env[@]}" "${proxy_cfg[@]}" \

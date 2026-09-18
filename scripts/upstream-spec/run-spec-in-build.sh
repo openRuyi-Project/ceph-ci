@@ -87,6 +87,7 @@ ci_open_run_log
 ci_trap_cleanup "${BUILD_CONTAINER}" "${DEPS_CONTAINER}"
 # The host clone and make-dist's tarball downloads go through the proxy.
 ci_resolve_proxy
+ci_github_token
 
 echo "=== ceph-ci upstream ceph.spec.in validation ==="
 echo "  repo=${CEPH_REPO} ref=${CEPH_REF}  checkout=${CEPH_SRC}"
@@ -147,6 +148,7 @@ STATE_DIR="${BASE}/state"
 mkdir -p "${STATE_DIR}"
 OFFLINE="${OFFLINE:-0}" "${REPO_ROOT}/scripts/fetch-openruyi-image.sh"
 ci_container_proxy_env
+ci_container_git_env
 spec_deps_fingerprint "${CEPH_SRC}/ceph.spec.in"
 spec_deps_image_ensure -v "${CEPH_SRC}:/ceph:ro"
 

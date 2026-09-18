@@ -105,6 +105,7 @@ spec_deps_image_ensure() {
 
 # spec_build_run RUN_ARGS...: run the container script's PHASE=build FROM DEPS_IMAGE
 # with the shared knobs and mounts; RUN_ARGS add the path-specific ones. Sets RC.
+# Needs PROXY_ENV and GIT_ENV -- %build fetches gtest-parallel/catch2 from github.
 # --pids-limit=-1 lifts podman's default 2048-pid cap, which a -j${NPROC} ninja build
 # with sccache exceeds ("posix_spawn: Resource temporarily unavailable").
 spec_build_run() {
@@ -123,6 +124,7 @@ spec_build_run() {
         -e "FILES_ONLY=${FILES_ONLY}" \
         -e "SKIP_CTEST=${SKIP_CTEST}" \
         "${PROXY_ENV[@]}" \
+        "${GIT_ENV[@]}" \
         -v "${SPEC_CONTAINER_SCRIPT}:/spec-build.sh:ro" \
         -v "${SPEC_CONTAINER_LIB}:/spec-lib.sh:ro" \
         -v "${SOURCES_CACHE}:/root/rpmbuild/SOURCES:Z" \

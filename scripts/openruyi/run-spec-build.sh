@@ -82,6 +82,7 @@ ci_trap_cleanup "${BUILD_CONTAINER}" "${DEPS_CONTAINER}" "${INSTALL_CONTAINER}"
 # spectool fetches Source0..33 from github.com and archives.boost.io; podman forwards
 # *_proxy into the container.
 ci_resolve_proxy
+ci_github_token
 
 echo "=== ceph-ci openRuyi spec validation ==="
 echo "  spec=${OPENRUYI_DIR}/ceph.spec  base=${BASE}  engine=${ENGINE}"
@@ -112,6 +113,7 @@ echo "  RESUME=${RESUME} FILES_ONLY=${FILES_ONLY} SKIP_CTEST=${SKIP_CTEST}  BUIL
 # 1. base image, deps image
 OFFLINE="${OFFLINE:-0}" "${REPO_ROOT}/scripts/fetch-openruyi-image.sh"
 ci_container_proxy_env
+ci_container_git_env
 spec_deps_fingerprint "${OPENRUYI_DIR}/ceph.spec"
 spec_deps_image_ensure -v "${OPENRUYI_DIR}:/spec:ro"
 
