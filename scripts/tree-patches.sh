@@ -33,6 +33,7 @@ TREE_PATCHES=(
     1094-cephfs-bench-fix-invalid-short-option-name-for-files.patch
     1095-kv-rocksdb_cache-fix-BinnedLRUCache-l_elems-counter-.patch
 
+    # https://github.com/ceph/ceph/pull/68184
     1097-test-add-RISC-V-architecture-probe-tests.patch
 
     # https://github.com/ceph/ceph/pull/70959

@@ -1,4 +1,4 @@
-From 5e0595bb19e73256051cb748bac85fd516472330 Mon Sep 17 00:00:00 2001
+From 046aa49e70953ec3833e2c6ad84af95fe5fe281f Mon Sep 17 00:00:00 2001
 From: Sun Yuechi <sunyuechi@iscas.ac.cn>
 Date: Tue, 14 Jul 2026 14:31:40 +0800
 Subject: [PATCH 1/4] osdc: fix ReplicaSplitOp chunk distribution and
@@ -29,7 +29,7 @@ Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
  2 files changed, 40 insertions(+), 31 deletions(-)
 
 diff --git a/src/osdc/SplitOp.cc b/src/osdc/SplitOp.cc
-index 7fbc65595442..962f537caad4 100644
+index 63c61ad9c4b3..2ddd04cc516c 100644
 --- a/src/osdc/SplitOp.cc
 +++ b/src/osdc/SplitOp.cc
 @@ -9,6 +9,8 @@
@@ -106,7 +106,7 @@ index 7fbc65595442..962f537caad4 100644
    uint64_t slice_count = replica_min_shard_read_size == 0 ? 1 :
                            std::min(length / replica_min_shard_read_size,
 -                                   osds.size());
--  uint64_t chunk_size = p2roundup(length / slice_count, (uint64_t)CEPH_PAGE_SIZE);
+-  uint64_t chunk_size = p2roundup(length / slice_count, REPLICA_MIN_SPLIT_SIZE);
 -  
 -  // Use reference_sub_read (set in constructor) as the starting shard
 -  // This provides load balancing while ensuring reference_sub_read is always set
@@ -116,7 +116,7 @@ index 7fbc65595442..962f537caad4 100644
 +  // Round up, otherwise chunk_count can exceed slice_count and reuse a
 +  // sub-read.
 +  uint64_t chunk_size = p2roundup(div_round_up(length, slice_count),
-+                                  (uint64_t)CEPH_PAGE_SIZE);
++                                  REPLICA_MIN_SPLIT_SIZE);
 +  uint64_t chunk_count = div_round_up(length, chunk_size);
 +
 +  // Window starts at reference_sub_read for load balancing; chunks are
@@ -141,10 +141,10 @@ index 7fbc65595442..962f537caad4 100644
  
  #undef dout_prefix
 diff --git a/src/osdc/SplitOp.h b/src/osdc/SplitOp.h
-index ae0a86d3c936..e2b0f41d86ae 100644
+index 66d943b03e6f..130b2ce96998 100644
 --- a/src/osdc/SplitOp.h
 +++ b/src/osdc/SplitOp.h
-@@ -557,7 +557,15 @@ class ReplicaSplitOp : public SplitOp {
+@@ -559,7 +559,15 @@ class ReplicaSplitOp : public SplitOp {
    bool version_mismatch() const override;
    
    void init_reference_sub_read() override;
@@ -162,7 +162,7 @@ index ae0a86d3c936..e2b0f41d86ae 100644
     * @brief Construct a ReplicaSplitOp.
     * @param op Original operation to be split
 
-From 1a37e205ec08b95738fc450280a1c2a4d9657d5f Mon Sep 17 00:00:00 2001
+From 8f704c385be99be1a06d80651cba5c8f67a00fd0 Mon Sep 17 00:00:00 2001
 From: Sun Yuechi <sunyuechi@iscas.ac.cn>
 Date: Tue, 14 Jul 2026 14:31:40 +0800
 Subject: [PATCH 2/4] osdc: handle reads below the min split size in multi-op
@@ -186,7 +186,7 @@ Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
  1 file changed, 10 insertions(+)
 
 diff --git a/src/osdc/SplitOp.cc b/src/osdc/SplitOp.cc
-index 962f537caad4..a32ee9dbd7fa 100644
+index 2ddd04cc516c..b7df51f35786 100644
 --- a/src/osdc/SplitOp.cc
 +++ b/src/osdc/SplitOp.cc
 @@ -288,6 +288,10 @@ std::pair<SplitOp::extent_set, bufferlist> ReplicaSplitOp::assemble_buffer_spars
@@ -221,7 +221,7 @@ index 962f537caad4..a32ee9dbd7fa 100644
    // sub-read.
    uint64_t chunk_size = p2roundup(div_round_up(length, slice_count),
 
-From 2cd80eabf67c03ea1fa0a1c261c1f9969b79cea0 Mon Sep 17 00:00:00 2001
+From bef025479e649857383e0d3a388bb763e6af352b Mon Sep 17 00:00:00 2001
 From: Sun Yuechi <sunyuechi@iscas.ac.cn>
 Date: Tue, 14 Jul 2026 14:31:40 +0800
 Subject: [PATCH 3/4] test/librados: cover ReplicaSplitOp reassembly and
@@ -235,11 +235,11 @@ below the minimum split size in a multi-op request.
 
 Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
 ---
- src/test/librados/split_op_cxx.cc | 209 ++++++++++++++++++++----------
- 1 file changed, 144 insertions(+), 65 deletions(-)
+ src/test/librados/split_op_cxx.cc | 213 +++++++++++++++++++++---------
+ 1 file changed, 148 insertions(+), 65 deletions(-)
 
 diff --git a/src/test/librados/split_op_cxx.cc b/src/test/librados/split_op_cxx.cc
-index eecb6d3a2c6d..ff4c3d829824 100644
+index aa674e4d023e..df5c27b0651b 100644
 --- a/src/test/librados/split_op_cxx.cc
 +++ b/src/test/librados/split_op_cxx.cc
 @@ -12,6 +12,21 @@ using namespace librados;
@@ -314,7 +314,7 @@ index eecb6d3a2c6d..ff4c3d829824 100644
  };
  
  typedef RadosTestECPP LibRadosSplitOpECPP;
-@@ -46,25 +104,10 @@ TEST_P(LibRadosSplitOpPP, BigRead) {
+@@ -47,25 +105,10 @@ TEST_P(LibRadosSplitOpPP, BigRead) {
    uint64_t min_split_size = std::stoull(min_split_size_str);
    bufferlist bl;
    bl.append_zero(3 * min_split_size);
@@ -342,7 +342,7 @@ index eecb6d3a2c6d..ff4c3d829824 100644
  
    ObjectReadOperation read;
    read.read(0, bl.length(), NULL, NULL);
-@@ -80,24 +123,10 @@ TEST_P(LibRadosSplitOpPP, ReadTwoShards) {
+@@ -82,24 +125,10 @@ TEST_P(LibRadosSplitOpPP, ReadTwoShards) {
    // Write data large enough to cover multiple shards
    bufferlist bl;
    bl.append_zero(min_split_size * 3);
@@ -369,7 +369,7 @@ index eecb6d3a2c6d..ff4c3d829824 100644
  
    // Test 1: Read exactly osd_min_split_replica_read_size - should NOT split
    {
-@@ -149,24 +178,10 @@ TEST_P(LibRadosSplitOpPP, StatBeforeRead) {
+@@ -152,24 +181,10 @@ TEST_P(LibRadosSplitOpPP, StatBeforeRead) {
    // Use buffer at least 2x min_split_size to force splitting across replicas
    bufferlist bl;
    bl.append_zero(min_split_size * 2);
@@ -396,7 +396,7 @@ index eecb6d3a2c6d..ff4c3d829824 100644
  
    // This test verifies the bug fix: STAT operation comes BEFORE READ
    // In ReplicaSplitOp::init(), when processing ops in order:
-@@ -208,26 +223,12 @@ TEST_P(LibRadosSplitOpPP, GetXattrBeforeRead) {
+@@ -212,26 +227,12 @@ TEST_P(LibRadosSplitOpPP, GetXattrBeforeRead) {
    std::string attr_value = "my_attr";
  
    bl.append_zero(min_split_size * 2);
@@ -425,11 +425,12 @@ index eecb6d3a2c6d..ff4c3d829824 100644
  
    // Another variant of the bug: GETXATTR before READ
    // This verifies that init_reference_sub_read() is called before processing GETXATTR
-@@ -246,6 +247,84 @@ TEST_P(LibRadosSplitOpPP, GetXattrBeforeRead) {
+@@ -250,6 +251,88 @@ TEST_P(LibRadosSplitOpPP, GetXattrBeforeRead) {
    ASSERT_EQ(min_split_size * 2, read_bl.length());
  }
  
 +TEST_P(LibRadosSplitOpPP, BigReadPattern) {
++  SKIP_IF_CRIMSON();
 +  bufferlist bl;
 +  ASSERT_NO_FATAL_FAILURE(write_pattern_object(3, 0, &bl));
 +
@@ -446,6 +447,7 @@ index eecb6d3a2c6d..ff4c3d829824 100644
 +}
 +
 +TEST_P(LibRadosSplitOpPP, UnalignedBigRead) {
++  SKIP_IF_CRIMSON();
 +  // One byte past three slices: a rounded-down chunk size produces a
 +  // fourth chunk, which used to wrap the window fully around and attach
 +  // two reads with a shared buffer to one sub-read.
@@ -461,6 +463,7 @@ index eecb6d3a2c6d..ff4c3d829824 100644
 +}
 +
 +TEST_P(LibRadosSplitOpPP, ShortReadInMultiOp) {
++  SKIP_IF_CRIMSON();
 +  bufferlist bl;
 +  ASSERT_NO_FATAL_FAILURE(write_pattern_object(2, 0, &bl));
 +
@@ -484,6 +487,7 @@ index eecb6d3a2c6d..ff4c3d829824 100644
 +}
 +
 +TEST_P(LibRadosSplitOpPP, ShortSparseReadInMultiOp) {
++  SKIP_IF_CRIMSON();
 +  bufferlist bl;
 +  ASSERT_NO_FATAL_FAILURE(write_pattern_object(2, 0, &bl));
 +
@@ -511,47 +515,28 @@ index eecb6d3a2c6d..ff4c3d829824 100644
    SKIP_IF_CRIMSON();
    bufferlist bl;
 
-From 41a8751bc512514743cf134c70e2f2714935ba68 Mon Sep 17 00:00:00 2001
+From 7795f9393a5e2fe3519e6ad6694cf200188d9a65 Mon Sep 17 00:00:00 2001
 From: Sun Yuechi <sunyuechi@iscas.ac.cn>
 Date: Tue, 14 Jul 2026 04:06:50 -0700
-Subject: [PATCH 4/4] osdc: avoid divide-by-zero in prepare_single_op on
- replicated pools
+Subject: [PATCH 4/4] osdc: restore the op target when SplitOp::create() gives
+ up
 
-stripe_width is 0 on a replicated pool, so chunk_size becomes 0 and the
-read offset is divided by it. Replicas hold the whole object and there
-is no shard to pin, so return early and let _op_submit() pick the
-target.
-
-create() clears BALANCE_READS and pins pgid, and _calc_target()
-short-circuits once pgid is set, so restore the target on every path
+create() clears BALANCE_READS and pins pgid before it knows whether
+the split goes ahead, and _calc_target() short-circuits once pgid is
+set. A request that aborts after that point is sent to the primary
+with the balanced-read flag lost. Restore the target on every path
 that gives up on the split.
 
 Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
 ---
- src/osdc/SplitOp.cc               | 16 ++++++++++++++--
- src/test/librados/split_op_cxx.cc | 25 +++++++++++++++++++++++++
- 2 files changed, 39 insertions(+), 2 deletions(-)
+ src/osdc/SplitOp.cc | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
 
 diff --git a/src/osdc/SplitOp.cc b/src/osdc/SplitOp.cc
-index a32ee9dbd7fa..f33a9fab257f 100644
+index b7df51f35786..06f1c6401c11 100644
 --- a/src/osdc/SplitOp.cc
 +++ b/src/osdc/SplitOp.cc
-@@ -901,7 +901,14 @@ void SplitOp::prepare_single_op(Objecter::Op *op, Objecter &objecter, CephContex
-   const pg_pool_t *pi = objecter.osdmap->get_pg_pool(target.base_oloc.pool);
-   ceph_assert(pi);
- 
-+  // No shard to pin on a replicated pool; _op_submit() computes the target.
-+  if (!pi->is_erasure()) {
-+    debug_op_summary("reuse_op:", op, cct);
-+    return;
-+  }
-+
-   objecter._calc_target(&op->target, op);
-+
-   uint64_t data_chunk_count = pi->get_ec_data_shard_count();
-   uint32_t chunk_size = pi->get_stripe_width() / data_chunk_count;
- 
-@@ -1015,7 +1022,9 @@ bool SplitOp::create(Objecter::Op *op, Objecter &objecter,
+@@ -1021,7 +1021,9 @@ bool SplitOp::create(Objecter::Op *op, Objecter &objecter,
      return false;
    }
  
@@ -562,7 +547,7 @@ index a32ee9dbd7fa..f33a9fab257f 100644
    target.flags &= ~CEPH_OSD_FLAG_BALANCE_READS;
    objecter._calc_target(&op->target, op);
  
-@@ -1025,9 +1034,10 @@ bool SplitOp::create(Objecter::Op *op, Objecter &objecter,
+@@ -1031,9 +1033,10 @@ bool SplitOp::create(Objecter::Op *op, Objecter &objecter,
    if (split_read->reference_sub_read == -1) {
      split_read->abort = true;
    }
@@ -574,7 +559,7 @@ index a32ee9dbd7fa..f33a9fab257f 100644
      return false;
    }
  
-@@ -1042,6 +1052,7 @@ bool SplitOp::create(Objecter::Op *op, Objecter &objecter,
+@@ -1048,6 +1051,7 @@ bool SplitOp::create(Objecter::Op *op, Objecter &objecter,
    // STAGE 5: Final abort check - discard split op if problems were detected
    if (split_read->abort) {
      ldout(cct, DBG_LVL) << __func__ <<" ABORTED 2" << dendl;
@@ -582,7 +567,7 @@ index a32ee9dbd7fa..f33a9fab257f 100644
      return false;
    }
  
-@@ -1049,6 +1060,7 @@ bool SplitOp::create(Objecter::Op *op, Objecter &objecter,
+@@ -1055,6 +1059,7 @@ bool SplitOp::create(Objecter::Op *op, Objecter &objecter,
    // fails, then this will catch the cases (albeit less efficiently).
    if (split_read->sub_reads.size() <= 1) {
      ldout(cct, DBG_LVL) << __func__ <<" reusing original op - inefficient" << dendl;
@@ -590,39 +575,3 @@ index a32ee9dbd7fa..f33a9fab257f 100644
      prepare_single_op(op, objecter, cct);
      split_read->abort = true; // Required for destructor.
      return false;
-diff --git a/src/test/librados/split_op_cxx.cc b/src/test/librados/split_op_cxx.cc
-index ff4c3d829824..322b497144b0 100644
---- a/src/test/librados/split_op_cxx.cc
-+++ b/src/test/librados/split_op_cxx.cc
-@@ -169,6 +169,31 @@ TEST_P(LibRadosSplitOpPP, ReadTwoShards) {
-   }
- }
- 
-+TEST_P(LibRadosSplitOpPP, SingleChunkAfterPageRoundup) {
-+  if (!split_ops) {
-+    GTEST_SKIP() << "Needs split_ops!";
-+  }
-+  ASSERT_EQ(0, cluster.conf_set("osd_min_split_replica_read_size", "1024"));
-+
-+  bufferlist bl = make_pattern_bl(2048);
-+  ObjectWriteOperation write1;
-+  write1.write(0, bl);
-+  ASSERT_TRUE(AssertOperateWithoutSplitOp(0, "foo", &write1));
-+  ASSERT_NO_FATAL_FAILURE(stabilize_pg_log(bl));
-+
-+  // validate() accepts 2048 (>= 2 * 1024), but chunk_size rounds up to 4096,
-+  // so the read serves whole off one replica instead of splitting.
-+  ObjectReadOperation read;
-+  bufferlist read_bl;
-+  read.read(0, bl.length(), NULL, NULL);
-+  ASSERT_TRUE(AssertOperateWithoutSplitOp(0, "foo", &read, &read_bl,
-+                                          balanced_read_flags));
-+  ASSERT_TRUE(read_bl.contents_equal(bl));
-+
-+  // Restore what SetUp() installed; later /0 tests read this value.
-+  ASSERT_EQ(0, cluster.conf_set("osd_min_split_replica_read_size", "262144"));
-+}
-+
- TEST_P(LibRadosSplitOpPP, StatBeforeRead) {
-   // Read the osd_min_split_replica_read_size config value
-   std::string min_split_size_str;
