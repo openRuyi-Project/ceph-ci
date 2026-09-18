@@ -107,6 +107,9 @@ TREE_PATCHES=(
     # raise LimitJobs per-job memory estimates under sanitizers; riscv64-only data,
     # stays local until verified on x86; depends on 1145
     2009-cmake-raise-LimitJobs-memory-estimates-for-sanitizer.patch
+
+    # rocksdb v9.11.2 headers lack <cstdint> under GCC 16; drop once ceph bumps the submodule
+    2010-cmake-rocksdb-force-include-cstdint-for-GCC-16.patch
 )
 # 2005: prefer the temporary OBS project (priority=1) for deps, falling back to the
 # stock repos. A .patch.in template: the driver substitutes TEMP_OBS_PROJECT /

@@ -1,0 +1,27 @@
+From deca35e400b4473111ab020b65729f4e1ef5861a Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Fri, 18 Sep 2026 01:18:48 -0700
+Subject: [PATCH] cmake/rocksdb: force-include <cstdint> for GCC 16
+
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ cmake/modules/BuildRocksDB.cmake | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/cmake/modules/BuildRocksDB.cmake b/cmake/modules/BuildRocksDB.cmake
+index 6bc9f187ca1..e3902c78975 100644
+--- a/cmake/modules/BuildRocksDB.cmake
++++ b/cmake/modules/BuildRocksDB.cmake
+@@ -69,6 +69,9 @@ function(build_rocksdb)
+   if(HAS_WARNING_PESSIMIZING_MOVE)
+     string(APPEND rocksdb_CXX_FLAGS " -Wno-pessimizing-move")
+   endif()
++  # rocksdb v9.11.2 headers use uint64_t without <cstdint>, which GCC 16's
++  # libstdc++ no longer includes transitively
++  string(APPEND rocksdb_CXX_FLAGS " -include cstdint")
+   if(rocksdb_CXX_FLAGS)
+     list(APPEND rocksdb_CMAKE_ARGS -DCMAKE_CXX_FLAGS='${rocksdb_CXX_FLAGS}')
+   endif()
+-- 
+2.55.0
+
