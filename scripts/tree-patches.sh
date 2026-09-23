@@ -18,8 +18,6 @@ TREE_PATCHES=(
 
     # https://github.com/ceph/ceph/pull/70966
     1060-osd-fix-misspelled-inject-ec-clear-command-names.patch
-    # https://github.com/ceph/ceph/pull/70965
-    1064-osd-avoid-inserting-empty-OI_ATTR-in-rollback_setatt.patch
 
     # todo
     1085-mgr-DaemonServer-fix-order-dependent-ok-to-stop-fals.patch
@@ -54,9 +52,6 @@ TREE_PATCHES=(
     1119-rgw-d4n-pass-next_cursor-by-reference-in-BucketDirec.patch
     1120-rgw-d4n-fix-operator-precedence-in-LFUDA-sync-error-.patch
     1121-rgw-amqp-avoid-dereferencing-end-in-multiple-ack-loo.patch
-
-    # https://github.com/ceph/ceph/pull/70007
-    1123-rgw-es-require-both-major-and-minor-in-ES-version-pa.patch
 
     1124-rgw-preserve-endpoint-base-path-prefix-in-REST-clien.patch
 
@@ -95,8 +90,6 @@ TREE_PATCHES=(
     # -- 2xxx: openRuyi downstream, not for upstream --
     # bump pylint 2.6.0 -> 2.17.7 for py3.13 / wrapt compat
     2001-monitoring-ceph-mixin-bump-pylint.patch
-    # bump cephadm pyfakefs pin to >=5.7,<6 for py3.13
-    2002-cephadm-tox-pyfakefs-py313.patch
 
     2006-common-cohort_lru-clear-active-flag-when-object-retu.patch
     2007-rgw-posix-insert-recycled-bucket-cache-entry-under-t.patch
@@ -107,9 +100,6 @@ TREE_PATCHES=(
     # raise LimitJobs per-job memory estimates under sanitizers; riscv64-only data,
     # stays local until verified on x86; depends on 1145
     2009-cmake-raise-LimitJobs-memory-estimates-for-sanitizer.patch
-
-    # rocksdb v9.11.2 headers lack <cstdint> under GCC 16; drop once ceph bumps the submodule
-    2010-cmake-rocksdb-force-include-cstdint-for-GCC-16.patch
 )
 # 2005: prefer the temporary OBS project (priority=1) for deps, falling back to the
 # stock repos. A .patch.in template: the driver substitutes TEMP_OBS_PROJECT /
