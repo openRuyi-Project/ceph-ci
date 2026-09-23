@@ -50,7 +50,8 @@
 #                 (sets build -j and BOOST_J; default set below, lower for the ASan
 #                 bucket). ctest -j is CTEST_JOBS.
 #   NINJA_MAX_COMPILE_JOBS / NINJA_MAX_LINK_JOBS  ninja compile/link job pools
-#                 (ceph's LimitJobs.cmake; the heavy pools are half of these).
+#                 (ceph's LimitJobs.cmake). Each also gets a separate heavy pool of
+#                 half its size, so up to 1.5x these run at once.
 #                 Defaults set below; empty leaves ceph's own memory-based sizing.
 #   CONTAINER_MEM podman --memory for the build container; default is host MemTotal
 #                 minus CONTAINER_MEM_RESERVE_GB (set below). Keeps an OOM inside the
@@ -103,7 +104,9 @@ if [ "${WITH_ASAN}" = 1 ]; then
     # = compile pool + link pool
     NPROC="${NPROC:-34}"
 else
-    NINJA_MAX_COMPILE_JOBS="${NINJA_MAX_COMPILE_JOBS:-}"
+    # ceph's memory-based sizing ignores the heavy pool on top, so a cold-cache
+    # build ran ~-j cc1plus at once and hit the host OOM killer.
+    NINJA_MAX_COMPILE_JOBS="${NINJA_MAX_COMPILE_JOBS:-24}"
     NINJA_MAX_LINK_JOBS="${NINJA_MAX_LINK_JOBS:-}"
     NPROC="${NPROC:-50}"
 fi
