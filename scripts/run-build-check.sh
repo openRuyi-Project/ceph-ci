@@ -180,7 +180,8 @@ ci_bool CI_GIT_TRACE 0
 
 ci_open_run_log
 
-# bwc's fixed container name; killed on interrupt.
+# bwc's fixed container name; killed on interrupt. Every run passes --replace so a
+# container left by an unclean shutdown does not block the name.
 BUILD_CONTAINER="ceph_build"
 # Short-lived container the fetch diagnostics run in, named for the cleanup trap.
 NETFAIL_CONTAINER="ceph_netfail_diag"
@@ -492,7 +493,7 @@ _capture_netfail_diag() {
     {
         echo "== ${label} hit a throttled fetch at $(date '+%F %T'), proxy=${GIT_PROXY} token=${tok} =="
         # shellcheck disable=SC2016  # NET_PROBE_* expand in the container's shell
-        "${ENGINE}" run --rm --name="${NETFAIL_CONTAINER}" \
+        "${ENGINE}" run --rm --replace --name="${NETFAIL_CONTAINER}" \
             "${proxy_env[@]}" "${proxy_cfg[@]}" \
             -eGIT_TRACE_CURL=1 -eGIT_TRACE_CURL_NO_DATA=1 -eGIT_TERMINAL_PROMPT=0 \
             -eNET_PROBE_REPO="${CI_NET_PROBE_REPO}" -eNET_PROBE_REF="${CI_NET_PROBE_REF}" \
@@ -554,6 +555,7 @@ _run_configure() {
         --container-engine "${ENGINE}" \
         "${NET_ARGS[@]}" \
         "${BUILD_TUNE_ARGS[@]}" \
+        --extra=--replace \
         --extra="-eCONFIGURE_ARGS=${CONFIGURE_ARGS}" \
         "${SYSTEM_SITE_ARG[@]}" \
         -e configure
@@ -568,6 +570,7 @@ _run_steps() {
         "${BUILD_TUNE_ARGS[@]}" \
         "${TD_TMPFS_ARGS[@]}" \
         "${SECCOMP_ARGS[@]}" \
+        --extra=--replace \
         --extra="-eCHECK_MAKEOPTS=${CHECK_MAKEOPTS}" \
         --extra="-eMAX_PARALLEL_JOBS=${MAX_PARALLEL_JOBS}" \
         --extra="-eCONFIGURE_ARGS=${CONFIGURE_ARGS}" \

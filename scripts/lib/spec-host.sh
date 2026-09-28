@@ -110,7 +110,7 @@ spec_deps_image_ensure() {
 # with sccache exceeds ("posix_spawn: Resource temporarily unavailable").
 spec_build_run() {
     set +e
-    "${ENGINE}" run --rm --name "${BUILD_CONTAINER}" \
+    "${ENGINE}" run --rm --replace --name "${BUILD_CONTAINER}" \
         --pids-limit=-1 \
         -e "PHASE=build" \
         -e "NPROC=${NPROC}" \
@@ -160,7 +160,7 @@ spec_install_check() {
     fi
     echo "=== install check: dnf install ${#rpms[@]} rpms into a clean ${CI_BASE_IMAGE} container ==="
     set +e
-    "${ENGINE}" run --rm --name "${INSTALL_CONTAINER}" \
+    "${ENGINE}" run --rm --replace --name "${INSTALL_CONTAINER}" \
         "${PROXY_ENV[@]}" \
         -v "${RPMS_OUT}:/rpms:ro,Z" \
         "${CI_BASE_IMAGE}" \
