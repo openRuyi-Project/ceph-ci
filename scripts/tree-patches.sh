@@ -61,31 +61,8 @@ TREE_PATCHES=(
     1128-rgw-keystone-check-barbican-401-before-generic-error.patch
     1129-rgw-posix-do-not-update-quota-stats-when-object-remo.patch
 
-    # https://github.com/ceph/ceph/pull/70149
-    1132-osd-PeeringState-fix-proc_master_log-divergence-chec.patch
-
-    1133-test-osd-add-unittest-for-proc_master_log-wind-forwa.patch
-
-    # https://github.com/ceph/ceph/pull/70207
-    1134-fix-replicasplitop-read.patch
-
     # https://github.com/ceph/ceph/pull/70211
     1140-src-common-optimize-Zvbc-CRC32C-for-riscv64.patch
-
-    # https://github.com/ceph/ceph/pull/70463
-    1143-test-mds-run-unittest_mds_quiesce_db-serially.patch
-
-    # https://github.com/ceph/ceph/pull/71249
-    1144-cmake-boost-don-t-pass-context-impl-to-the-headers-s.patch
-
-    # https://github.com/ceph/ceph/pull/71460
-    1045-qa-lsan.supp-match-OpenSSL-error-state-on-ERR_set_ma.patch
-
-    # lancedb-c bump lives on the sunyuechi/lancedb-c fork until upstream takes it;
-    # off until lance-linalg builds on riscv64 (1148 disables lancedb there)
-    # 1147-rgw-lancedb-bump-lancedb-to-0.39.0-lance-12.patch
-
-    1148-build-default-WITH_RADOSGW_LANCEDB-off-where-lance-c.patch
 
     # -- 2xxx: openRuyi downstream, not for upstream --
     # bump pylint 2.6.0 -> 2.17.7 for py3.13 / wrapt compat
