@@ -5,8 +5,6 @@
 # upstream-bound (comment links the PR), 2xxx = openRuyi downstream.
 TREE_PATCHES=(
     # -- 1xxx: upstream-bound --
-    # https://github.com/ceph/ceph/pull/69448
-    1004-pmdk-riscv64-use-daos-stack.patch
     # https://github.com/ceph/ceph/pull/69519
     1024-pybind-rbd-rgw-place-nogil-after-the-exception-speci.patch
     # https://github.com/ceph/ceph/pull/69643
@@ -51,7 +49,6 @@ TREE_PATCHES=(
     1118-rgw-keystone-guard-against-empty-secret-file-in-read.patch
     1119-rgw-d4n-pass-next_cursor-by-reference-in-BucketDirec.patch
     1120-rgw-d4n-fix-operator-precedence-in-LFUDA-sync-error-.patch
-    1121-rgw-amqp-avoid-dereferencing-end-in-multiple-ack-loo.patch
 
     1124-rgw-preserve-endpoint-base-path-prefix-in-REST-clien.patch
 
@@ -61,31 +58,8 @@ TREE_PATCHES=(
     1128-rgw-keystone-check-barbican-401-before-generic-error.patch
     1129-rgw-posix-do-not-update-quota-stats-when-object-remo.patch
 
-    # https://github.com/ceph/ceph/pull/70149
-    1132-osd-PeeringState-fix-proc_master_log-divergence-chec.patch
-
-    1133-test-osd-add-unittest-for-proc_master_log-wind-forwa.patch
-
-    # https://github.com/ceph/ceph/pull/70207
-    1134-fix-replicasplitop-read.patch
-
     # https://github.com/ceph/ceph/pull/70211
     1140-src-common-optimize-Zvbc-CRC32C-for-riscv64.patch
-
-    # https://github.com/ceph/ceph/pull/70463
-    1143-test-mds-run-unittest_mds_quiesce_db-serially.patch
-
-    # https://github.com/ceph/ceph/pull/71249
-    1144-cmake-boost-don-t-pass-context-impl-to-the-headers-s.patch
-
-    # https://github.com/ceph/ceph/pull/71460
-    1045-qa-lsan.supp-match-OpenSSL-error-state-on-ERR_set_ma.patch
-
-    # lancedb-c bump lives on the sunyuechi/lancedb-c fork until upstream takes it;
-    # off until lance-linalg builds on riscv64 (1148 disables lancedb there)
-    # 1147-rgw-lancedb-bump-lancedb-to-0.39.0-lance-12.patch
-
-    1148-build-default-WITH_RADOSGW_LANCEDB-off-where-lance-c.patch
 
     # -- 2xxx: openRuyi downstream, not for upstream --
     # bump pylint 2.6.0 -> 2.17.7 for py3.13 / wrapt compat

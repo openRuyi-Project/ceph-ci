@@ -47,7 +47,7 @@ Inside every bucket the same names recur (so the layout is identical across CIs)
 | `build/` | spec paths only: the persisted rpm `BUILD/` tree (cmake build + BUILDROOT) |
 | `sources/` `rpms/` `artifacts/` `state/` | spec paths only: spectool/make-dist tarballs, built rpms, ctest `Testing/`+`CMakeCache`, generated spec |
 | `sccache-cache/` | the per-CI sccache cache (kept separate so differing compile flags don't churn one shared cache) |
-| `ccache-cache/` | build-check only: the ccache cache, for the ExternalProjects (arrow, pmdk) that compile via their own make instead of ceph's `-DWITH_SCCACHE=ON` |
+| `ccache-cache/` | build-check only: the ccache cache, for the ExternalProjects (arrow) that compile via their own make instead of ceph's `-DWITH_SCCACHE=ON` |
 | `.image-fp` / `.deps-fp` / `.deps-pkghash` / `.deps-meta` | cached build/deps-image fingerprints |
 
 ## Running by hand (riscv64 host)

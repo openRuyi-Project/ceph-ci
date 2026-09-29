@@ -16,18 +16,18 @@ Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/src/tools/cephfs/cephfs-tool.cc b/src/tools/cephfs/cephfs-tool.cc
-index afb4c21dd50..3e75f8b782f 100644
+index f60a451283b..5389573c922 100644
 --- a/src/tools/cephfs/cephfs-tool.cc
 +++ b/src/tools/cephfs/cephfs-tool.cc
-@@ -696,7 +696,7 @@ int main(int argc, char **argv) {
+@@ -1831,7 +1831,7 @@ int main(int argc, char **argv) {
      ("conf,c", po::value<string>(&config.ceph_conf), "Ceph config file path")
      ("id,i", po::value<string>(&config.userid)->default_value("admin"), "Client ID")
      ("keyring,k", po::value<string>(&config.keyring), "Path to keyring file")
 -    ("filesystem,fs", po::value<string>(&config.filesystem), "CephFS filesystem name to mount")
 +    ("filesystem", po::value<string>(&config.filesystem), "CephFS filesystem name to mount")
      ("uid", po::value<int>(&config.uid)->default_value(-1), "User ID to mount as")
-     ("gid", po::value<int>(&config.gid)->default_value(-1), "Group ID to mount as");
- 
+     ("gid", po::value<int>(&config.gid)->default_value(-1), "Group ID to mount as")
+     ("client-oc", po::value<string>(&config.client_oc), "Set the 'client_oc' option (0|1)")
 -- 
 2.54.0
 

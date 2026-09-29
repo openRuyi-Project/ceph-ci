@@ -122,9 +122,8 @@ CONFIGURE_FLAGS=(
     # cmake defaults ON; needs npm, and even ceph.spec.in turns it OFF unconditionally
     -DWITH_MGR_DASHBOARD_FRONTEND=OFF
     # No -DCMAKE_BUILD_TYPE: track upstream, which defaults a git checkout to Debug.
-    # Both below are on in upstream's make-check CI (ceph-pull-requests{,-arm64}).
+    # On in upstream's make-check CI (ceph-pull-requests{,-arm64}).
     -DWITH_CRIMSON=ON
-    -DWITH_RBD_RWL=ON
     # No -DWITH_MOLD: mold 2.41 drops the .symver aliases librados.so exports, and a
     # mold-linked crimson-osd segfaults in mkfs. The build links with ld.bfd.
     # add_ceph_test stamps every test with this as a TIMEOUT property, which overrides
@@ -316,7 +315,7 @@ fi
 #   sccache: ceph itself (-DWITH_SCCACHE=ON). Content-addressed, so a clean build/
 #           still hits. SCCACHE_IDLE_TIMEOUT=0: the server otherwise shut down
 #           mid-build and the compile fell back to uncached.
-#   ccache: the ExternalProjects driven by their own make (arrow, pmdk). CCACHE_DIR
+#   ccache: the ExternalProjects driven by their own make (arrow). CCACHE_DIR
 #           pins the dir where run-make.sh's save/restore_ccache_conf expects it;
 #           run-make.sh only raises max_size past 5G under in_jenkins.
 SCCACHE_HOST_DIR="${SCCACHE_HOST_DIR:-${BASE}/sccache-cache}"
