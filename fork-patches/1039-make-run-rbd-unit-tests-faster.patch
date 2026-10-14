@@ -2984,10 +2984,10 @@ Subject: [PATCH 3/3] test_DiffIterate.cc
 Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
 ---
  src/test/librbd/CMakeLists.txt      |   1 +
- src/test/librbd/test_DiffIterate.cc | 547 ++++++++++++++++++++++++++++
+ src/test/librbd/test_DiffIterate.cc | 548 ++++++++++++++++++++++++++++
  src/test/librbd/test_librbd.cc      | 504 -------------------------
  src/test/librbd/test_main.cc        |   2 +
- 4 files changed, 550 insertions(+), 504 deletions(-)
+ 4 files changed, 551 insertions(+), 504 deletions(-)
  create mode 100644 src/test/librbd/test_DiffIterate.cc
 
 diff --git a/src/test/librbd/CMakeLists.txt b/src/test/librbd/CMakeLists.txt
@@ -3004,13 +3004,14 @@ index f93d6d34a13c..9a01716fd4e9 100644
    test_Migration.cc
 diff --git a/src/test/librbd/test_DiffIterate.cc b/src/test/librbd/test_DiffIterate.cc
 new file mode 100644
-index 000000000000..89864050cd2d
+index 000000000000..8dbe4354d8fb
 --- /dev/null
 +++ b/src/test/librbd/test_DiffIterate.cc
-@@ -0,0 +1,547 @@
+@@ -0,0 +1,548 @@
 +// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
 +// vim: ts=8 sw=2 sts=2 expandtab
 +
++#include "include/intarith.h" // for round_up_to()
 +#include "include/rbd/librbd.h"
 +#include "include/rbd/librbd.hpp"
 +#include "test/librbd/test_fixture.h"
