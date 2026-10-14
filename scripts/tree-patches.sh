@@ -61,9 +61,6 @@ TREE_PATCHES=(
     # https://github.com/ceph/ceph/pull/70211
     1140-src-common-optimize-Zvbc-CRC32C-for-riscv64.patch
 
-    # todo
-    1149-cmake-make-SIMD_COMPILE_FLAGS-a-list.patch
-
     # -- 2xxx: openRuyi downstream, not for upstream --
     # bump pylint 2.6.0 -> 2.17.7 for py3.13 / wrapt compat
     2001-monitoring-ceph-mixin-bump-pylint.patch
