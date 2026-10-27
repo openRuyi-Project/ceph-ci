@@ -40,6 +40,12 @@
             "ref": "re-enable once promtool is baked into the build image"
         },
         {
+            "test": "run-tox-grafana-lint",
+            "type": "exclude",
+            "reason": "requirements-lint.txt pins pylint==2.17.7, whose astroid uses ast.Str (removed in python 3.14); pylint crashes with astroid-error",
+            "ref": "re-enable once ceph bumps the pylint pin"
+        },
+        {
             "test": "jsonnet-bundler-build",
             "type": "flake",
             "reason": "jsonnet-bundler-build.sh git-clones github.com/jsonnet-bundler/jsonnet-bundler at test time with no retry; a proxy/github hiccup fails the clone and takes its dependent run-tox-jsonnet-check down as Not Run",
