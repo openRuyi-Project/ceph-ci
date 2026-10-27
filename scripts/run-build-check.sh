@@ -297,6 +297,9 @@ if [ -n "${_drop_reason}" ]; then
     if [ "${#_stale_imgs[@]}" -gt 0 ]; then
         "${ENGINE}" rmi -f "${_stale_imgs[@]}" >/dev/null 2>&1 || true
     fi
+    # run-cli-tests reuses its cram venv whenever bin/cram exists; a python3 upgrade
+    # in the new image leaves it pointing at the old site-packages.
+    rm -rf "${CEPH_SRC}/src/test/virtualenv"
 fi
 printf '%s\n' "${IMG_FP}" > "${IMG_FP_FILE}"
 
