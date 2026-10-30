@@ -18,9 +18,6 @@ TREE_PATCHES=(
     1060-osd-fix-misspelled-inject-ec-clear-command-names.patch
 
     # todo
-    1085-mgr-DaemonServer-fix-order-dependent-ok-to-stop-fals.patch
-
-    # todo
     1089-ceph_dedup-avoid-divide-by-zero-in-EstimateResult-du.patch
     1090-ceph_dedup-write-chunk-data-at-offset-0-in-make_dedu.patch
     1091-ceph_dedup-validate-sampling-ratio-range-in-daemon.patch
