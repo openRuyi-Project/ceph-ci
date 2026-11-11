@@ -580,6 +580,18 @@ _run_steps() {
         "${EXEC[@]}"
 }
 
+# Record the package set the build image carries, so a red run can be pinned on
+# (or cleared of) a dep bump.
+_snapshot_build_image() {
+    echo "=== build image packages (${BUILD_IMAGE}) ==="
+    if ! "${ENGINE}" image inspect "${BUILD_IMAGE}" >/dev/null 2>&1; then
+        echo "  (image not present; skipping snapshot)" >&2
+        return 0
+    fi
+    "${ENGINE}" run --rm --network none "${BUILD_IMAGE}" \
+        rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort
+}
+
 # Configure in a td-free container first, then build + ctest with the tmpfs td
 # mounted. The split is required: mounting the td at /ceph/build/td makes podman
 # pre-create /ceph/build, and do_cmake.sh refuses to configure into an existing
@@ -601,6 +613,7 @@ else
 fi
 
 if [ "${RC}" -eq 0 ]; then
+    _snapshot_build_image
     _net_retry "STEPS run" _run_steps
 fi
 set -e
