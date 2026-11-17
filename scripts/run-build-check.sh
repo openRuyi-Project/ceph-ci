@@ -184,6 +184,8 @@ ci_open_run_log
 BUILD_CONTAINER="ceph_build"
 # Short-lived container the fetch diagnostics run in, named for the cleanup trap.
 NETFAIL_CONTAINER="ceph_netfail_diag"
+# Short-lived container that pre-installs the cli-tests venv (see _prepare_cli_venv).
+CLI_VENV_CONTAINER="ceph_cli_venv"
 # The image bwc builds the deps into and runs every step in ("ceph-build:<branch>.<distro>").
 BUILD_IMAGE="ceph-build:HEAD.openruyi"
 # shellcheck disable=SC2329  # run from the signal trap via CI_CLEANUP_HOOK
@@ -193,7 +195,7 @@ _drop_steps_out() {
     fi
 }
 CI_CLEANUP_HOOK=_drop_steps_out
-ci_trap_cleanup "${BUILD_CONTAINER}" "${NETFAIL_CONTAINER}"
+ci_trap_cleanup "${BUILD_CONTAINER}" "${NETFAIL_CONTAINER}" "${CLI_VENV_CONTAINER}"
 
 # GIT_PROXY: explicit value wins; unset -> probe the proxy (scripts/lib/site.sh).
 ci_resolve_proxy
@@ -580,6 +582,44 @@ _run_steps() {
         "${EXEC[@]}"
 }
 
+# Install the cli-tests cram venv up front, from a full clone. run-cli-tests builds it
+# itself only when bin/cram is missing, and pip clones cram with --filter=blob:none; the
+# promisor lazy fetch that follows (one POST asking for every blob of the checkout)
+# comes back HTTP 400 through this proxy while a plain clone of the same repository
+# works, so that install can never succeed and the venv stays missing.
+_prepare_cli_venv() {
+    local venv="${CEPH_SRC}/src/test/virtualenv"
+    if [ -e "${venv}/bin/cram" ]; then
+        return 0
+    fi
+    case ",${STEPS}," in
+        *,tests,*) ;;
+        *) return 0 ;;
+    esac
+    if ! "${ENGINE}" image inspect "${BUILD_IMAGE}" >/dev/null 2>&1; then
+        echo "  build image ${BUILD_IMAGE} absent; leaving the cram venv to run-cli-tests" >&2
+        return 0
+    fi
+    echo "=== installing cram into ${venv} (full clone; pip's blobless clone 400s here) ==="
+    ci_container_proxy_env
+    ci_container_git_env
+    if ! "${ENGINE}" run --rm --replace --name="${CLI_VENV_CONTAINER}" \
+            "${PROXY_ENV[@]}" "${GIT_ENV[@]}" \
+            --volume="${CEPH_SRC}:/ceph:Z" \
+            "${BUILD_IMAGE}" bash -c '
+                set -e
+                git clone --quiet --branch 0.7-error-dir --depth 1 \
+                    https://github.com/ceph/cram.git /tmp/cram
+                python3 -m venv /ceph/src/test/virtualenv
+                /ceph/src/test/virtualenv/bin/pip --log /ceph/src/test/virtualenv/log.txt \
+                    install --upgrade pip setuptools wheel
+                /ceph/src/test/virtualenv/bin/pip --log /ceph/src/test/virtualenv/log.txt \
+                    install /tmp/cram
+            '; then
+        echo "WARNING: cram pre-install failed; run-cli-tests falls back to pip's blobless clone" >&2
+    fi
+}
+
 # Record the package set the build image carries, so a red run can be pinned on
 # (or cleared of) a dep bump.
 _snapshot_build_image() {
@@ -614,6 +654,7 @@ fi
 
 if [ "${RC}" -eq 0 ]; then
     _snapshot_build_image
+    _prepare_cli_venv
     _net_retry "STEPS run" _run_steps
 fi
 set -e
