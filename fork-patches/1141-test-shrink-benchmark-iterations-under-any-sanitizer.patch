@@ -1,0 +1,284 @@
+From 2ea30634f77eafc749f1e0ceffe6e4bb43c2df08 Mon Sep 17 00:00:00 2001
+From: Dominik Raddatz <dominik.raddatz@clyso.com>
+Date: Wed, 30 Sep 2026 12:43:36 +0200
+Subject: [PATCH] test: shrink benchmark iterations under any sanitizer
+
+e16e6398b1e cut the bufferlist benchmark rounds to 2 under ASan.
+Extend that to all sanitizers with sanitized_bench_rounds(), keyed on
+a new CEPH_SANITIZED define (UBSan has no compiler macro of its own),
+and use it for csum_bench and the transaction and mem_is_zero()
+benchmarks too.  Only pure repetition is cut; every case still runs.
+
+Under TSan (GCC 15.2, Debug), unittest_bufferlist, by far the longest
+unit test, drops from about 26 min to 33 s.  unittest_bluestore_types,
+one of the longest remaining, drops from about 225 s to 200 s, as its
+csum_bench case goes from about 25 s to under 1 s.  unittest_transaction
+and unittest_memory drop from about 19 s and 15 s to under 1 s.
+Builds without sanitizers are unchanged.
+
+Signed-off-by: Dominik Raddatz <dominik.raddatz@clyso.com>
+---
+ CMakeLists.txt                               |  3 ++
+ src/test/bufferlist.cc                       | 51 ++++++++------------
+ src/test/common/test_memory.cc               |  3 +-
+ src/test/objectstore/test_bluestore_types.cc |  3 +-
+ src/test/objectstore/test_transaction.cc     |  3 +-
+ src/test/sanitized_bench.h                   | 18 +++++++
+ 6 files changed, 47 insertions(+), 34 deletions(-)
+ create mode 100644 src/test/sanitized_bench.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 94c3fdaee75..3727cd6d2dc 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -813,6 +813,9 @@ endif()
+ if(sanitizers)
+   find_package(Sanitizers REQUIRED ${sanitizers})
+   add_compile_options(${Sanitizers_COMPILE_OPTIONS})
++  # UBSan has no compiler macro like __SANITIZE_THREAD__, so tell the code
++  # ourselves that a sanitizer is enabled.
++  add_compile_definitions(CEPH_SANITIZED)
+   string(REPLACE ";" " " sanitiers_compile_flags "${Sanitizers_COMPILE_OPTIONS}")
+   string(APPEND CMAKE_EXE_LINKER_FLAGS " ${sanitiers_compile_flags}")
+   string(APPEND CMAKE_SHARED_LINKER_FLAGS " ${sanitiers_compile_flags}")
+diff --git a/src/test/bufferlist.cc b/src/test/bufferlist.cc
+index 801f7176687..6b09ce5e85b 100644
+--- a/src/test/bufferlist.cc
++++ b/src/test/bufferlist.cc
+@@ -43,22 +43,11 @@
+ #include "sys/stat.h"
+ #include "include/crc32c.h"
+ #include "common/sctp_crc32.h"
++#include "test/sanitized_bench.h"
+ 
+ #define MAX_TEST 1000000
+ #define FILENAME "bufferlist"
+ 
+-#ifndef __has_feature
+-#define __has_feature(x) 0
+-#endif
+-#if __has_feature(address_sanitizer) || defined(__SANITIZE_ADDRESS__)
+-static constexpr bool bench_under_asan = true;
+-#else
+-static constexpr bool bench_under_asan = false;
+-#endif
+-static constexpr size_t asan_bench_rounds(size_t full) {
+-  return bench_under_asan ? (full < 2 ? full : 2) : full;
+-}
+-
+ using namespace std;
+ 
+ static char cmd[128];
+@@ -152,7 +141,7 @@ void bench_buffer_alloc(int size, int num)
+ }
+ 
+ TEST(Buffer, BenchAlloc) {
+-  const int n = asan_bench_rounds(1000000);
++  const int n = sanitized_bench_rounds(1000000);
+   bench_buffer_alloc(16384, n);
+   bench_buffer_alloc(4096, n);
+   bench_buffer_alloc(1024, n);
+@@ -557,7 +546,7 @@ TEST(BufferPtr, copy_out_bench) {
+   for (int s=1; s<=8; s*=2) {
+     utime_t start = ceph_clock_now();
+     int buflen = 1048576;
+-    int count = asan_bench_rounds(1000);
++    int count = sanitized_bench_rounds(1000);
+     uint64_t v;
+     for (int i=0; i<count; ++i) {
+       bufferptr bp(buflen);
+@@ -596,7 +585,7 @@ TEST(BufferPtr, copy_in_bench) {
+   for (int s=1; s<=8; s*=2) {
+     utime_t start = ceph_clock_now();
+     int buflen = 1048576;
+-    int count = asan_bench_rounds(1000);
++    int count = sanitized_bench_rounds(1000);
+     for (int i=0; i<count; ++i) {
+       bufferptr bp(buflen);
+       for (int64_t j=0; j<buflen; j += s) {
+@@ -640,7 +629,7 @@ TEST(BufferPtr, append_bench) {
+   for (int s=4; s<=16384; s*=4) {
+     utime_t start = ceph_clock_now();
+     int buflen = 1048576;
+-    int count = asan_bench_rounds(4000);
++    int count = sanitized_bench_rounds(4000);
+     for (int i=0; i<count; ++i) {
+       bufferptr bp(buflen);
+       bp.set_length(0);
+@@ -846,15 +835,15 @@ static void bench_bufferlistiter_deref(const size_t step,
+ }
+ 
+ TEST(BufferListIterator, BenchDeref) {
+-  bench_bufferlistiter_deref(1, 1, asan_bench_rounds(4096000));
+-  bench_bufferlistiter_deref(1, 10, asan_bench_rounds(409600));
+-  bench_bufferlistiter_deref(1, 100, asan_bench_rounds(40960));
+-  bench_bufferlistiter_deref(1, 1000, asan_bench_rounds(4096));
++  bench_bufferlistiter_deref(1, 1, sanitized_bench_rounds(4096000));
++  bench_bufferlistiter_deref(1, 10, sanitized_bench_rounds(409600));
++  bench_bufferlistiter_deref(1, 100, sanitized_bench_rounds(40960));
++  bench_bufferlistiter_deref(1, 1000, sanitized_bench_rounds(4096));
+ 
+-  bench_bufferlistiter_deref(4, 1, asan_bench_rounds(1024000));
+-  bench_bufferlistiter_deref(4, 10, asan_bench_rounds(102400));
+-  bench_bufferlistiter_deref(4, 100, asan_bench_rounds(10240));
+-  bench_bufferlistiter_deref(4, 1000, asan_bench_rounds(1024));
++  bench_bufferlistiter_deref(4, 1, sanitized_bench_rounds(1024000));
++  bench_bufferlistiter_deref(4, 10, sanitized_bench_rounds(102400));
++  bench_bufferlistiter_deref(4, 100, sanitized_bench_rounds(10240));
++  bench_bufferlistiter_deref(4, 1000, sanitized_bench_rounds(1024));
+ }
+ 
+ TEST(BufferListIterator, advance) {
+@@ -1369,7 +1358,7 @@ void bench_bufferlist_alloc(int size, int num, int per)
+ }
+ 
+ TEST(BufferList, BenchAlloc) {
+-  const int n = asan_bench_rounds(100000);
++  const int n = sanitized_bench_rounds(100000);
+   bench_bufferlist_alloc(32768, n, 16);
+   bench_bufferlist_alloc(25000, n, 16);
+   bench_bufferlist_alloc(16384, n, 16);
+@@ -1405,7 +1394,7 @@ TEST(BufferList, append_bench_with_size_hint) {
+   for (size_t step = 4; step <= 16384; step *= 4) {
+     const utime_t start = ceph_clock_now();
+ 
+-    constexpr size_t rounds = asan_bench_rounds(4000);
++    constexpr size_t rounds = sanitized_bench_rounds(4000);
+     for (size_t r = 0; r < rounds; ++r) {
+       ceph::bufferlist bl(std::size(src));
+       for (auto iter = std::begin(src);
+@@ -1422,7 +1411,7 @@ TEST(BufferList, append_bench_with_size_hint) {
+ 
+ TEST(BufferList, append_bench_with_size_hint2) {
+   std::array<char, 1048576> src = { 0, };
+-  constexpr size_t rounds = asan_bench_rounds(4000);
++  constexpr size_t rounds = sanitized_bench_rounds(4000);
+   constexpr int conc_bl = 400;
+   std::vector<ceph::bufferlist*> bls(conc_bl);
+ 
+@@ -1453,7 +1442,7 @@ TEST(BufferList, append_bench) {
+   std::array<char, 1048576> src = { 0, };
+   for (size_t step = 4; step <= 16384; step *= 4) {
+     const utime_t start = ceph_clock_now();
+-    constexpr size_t rounds = asan_bench_rounds(4000);
++    constexpr size_t rounds = sanitized_bench_rounds(4000);
+     for (size_t r = 0; r < rounds; ++r) {
+       ceph::bufferlist bl;
+       for (auto iter = std::begin(src);
+@@ -1470,7 +1459,7 @@ TEST(BufferList, append_bench) {
+ 
+ TEST(BufferList, append_bench2) {
+   std::array<char, 1048576> src = { 0, };
+-  constexpr size_t rounds = asan_bench_rounds(4000);
++  constexpr size_t rounds = sanitized_bench_rounds(4000);
+   constexpr int conc_bl = 400;
+   std::vector<ceph::bufferlist*> bls(conc_bl);
+ 
+@@ -1502,7 +1491,7 @@ TEST(BufferList, append_hole_bench) {
+ 
+   for (size_t step = 512; step <= 65536; step *= 2) {
+     const utime_t start = ceph_clock_now();
+-    constexpr size_t rounds = asan_bench_rounds(80000);
++    constexpr size_t rounds = sanitized_bench_rounds(80000);
+     for (size_t r = 0; r < rounds; ++r) {
+       ceph::bufferlist bl;
+       while (bl.length() < targeted_bl_size) {
+@@ -1517,7 +1506,7 @@ TEST(BufferList, append_hole_bench) {
+ 
+ TEST(BufferList, append_hole_bench2) {
+   constexpr size_t targeted_bl_size = 1048576;
+-  constexpr size_t rounds = asan_bench_rounds(80000);
++  constexpr size_t rounds = sanitized_bench_rounds(80000);
+   constexpr int conc_bl = 400;
+   std::vector<ceph::bufferlist*> bls(conc_bl);
+ 
+diff --git a/src/test/common/test_memory.cc b/src/test/common/test_memory.cc
+index 94d82d89d43..71e4995df4d 100644
+--- a/src/test/common/test_memory.cc
++++ b/src/test/common/test_memory.cc
+@@ -8,6 +8,7 @@
+ #include "include/inline_memory.h"
+ #include "include/utime.h"
+ #include "common/Clock.h"
++#include "test/sanitized_bench.h"
+ #include "gtest/gtest.h"
+ 
+ class MemoryIsZeroBigTest : public ::testing::TestWithParam<size_t> {};
+@@ -39,7 +40,7 @@ TEST_P(MemoryIsZeroSmallTest, MemoryIsZeroTestSmall) {
+ }
+ 
+ TEST_P(MemoryIsZeroPerformance, MemoryIsZeroPerformanceTest) {
+-  constexpr size_t ITER = 1000000;
++  constexpr size_t ITER = sanitized_bench_rounds(1000000);
+   utime_t start;
+   utime_t end;
+ 
+diff --git a/src/test/objectstore/test_bluestore_types.cc b/src/test/objectstore/test_bluestore_types.cc
+index 85ccf1845db..6d2244eb333 100644
+--- a/src/test/objectstore/test_bluestore_types.cc
++++ b/src/test/objectstore/test_bluestore_types.cc
+@@ -17,6 +17,7 @@
+ #include "perfglue/heap_profiler.h"
+ #include "os/bluestore/Writer.h"
+ #include "common/pretty_binary.h"
++#include "test/sanitized_bench.h"
+ #include <bitset>
+ #include <sstream>
+ #include <boost/random/mersenne_twister.hpp>
+@@ -439,7 +440,7 @@ TEST(bluestore_blob_t, csum_bench) {
+   for (char *a = bp.c_str(); a < bp.c_str() + bp.length(); ++a)
+     *a = (unsigned long)a & 0xff;
+   bl.append(bp);
+-  int count = 256;
++  int count = sanitized_bench_rounds(256);
+   for (unsigned csum_type = 1; csum_type < Checksummer::CSUM_MAX; ++csum_type) {
+     bluestore_blob_t b;
+     b.init_csum(csum_type, 12, bl.length());
+diff --git a/src/test/objectstore/test_transaction.cc b/src/test/objectstore/test_transaction.cc
+index 6d417c5187f..782c3f56fc3 100644
+--- a/src/test/objectstore/test_transaction.cc
++++ b/src/test/objectstore/test_transaction.cc
+@@ -17,6 +17,7 @@
+ #include <gtest/gtest.h>
+ #include "common/Clock.h"
+ #include "include/utime.h"
++#include "test/sanitized_bench.h"
+ #include <boost/tuple/tuple.hpp>
+ 
+ using namespace std;
+@@ -215,7 +216,7 @@ TEST(Transaction, GetNumBytesAligned)
+ 
+ void bench_num_bytes(bool legacy)
+ {
+-  const int max = 2500000;
++  const int max = sanitized_bench_rounds(2500000);
+   auto a = generate_transaction();
+ 
+   if (legacy) {
+diff --git a/src/test/sanitized_bench.h b/src/test/sanitized_bench.h
+new file mode 100644
+index 00000000000..73fcb36a718
+--- /dev/null
++++ b/src/test/sanitized_bench.h
+@@ -0,0 +1,18 @@
++// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
++// vim: ts=8 sw=2 sts=2 expandtab
++
++#pragma once
++
++#include <cstddef>
++
++#ifdef CEPH_SANITIZED  // set in top-level CMakeLists.txt for any sanitizer
++inline constexpr bool bench_under_sanitizer = true;
++#else
++inline constexpr bool bench_under_sanitizer = false;
++#endif
++
++// Only for loops that merely repeat the same work: the distinct cases (sizes,
++// algorithms, ...) must stay in an outer loop, so coverage is unchanged.
++inline constexpr size_t sanitized_bench_rounds(size_t full) {
++  return (bench_under_sanitizer && full > 2) ? 2 : full;
++}
+-- 
+2.56.1
+
