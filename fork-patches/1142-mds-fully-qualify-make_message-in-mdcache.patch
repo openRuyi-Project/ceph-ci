@@ -1,0 +1,31 @@
+From 13ee8be8d306cb1af0cd9789deaa8374aabd9ce6 Mon Sep 17 00:00:00 2001
+From: Sun Yuechi <sunyuechi@iscas.ac.cn>
+Date: Sat, 21 Nov 2026 01:27:28 -0800
+Subject: [PATCH] mds: Fully qualify make_message in MDCache
+
+db3519258f0 added an unqualified call to make_message<MClientReply>().
+MClientReply friends both ceph::make_message and crimson::make_message,
+and GCC 16 finds the latter through ADL, making the call ambiguous.
+
+Fixes: https://tracker.ceph.com/issues/83399
+Signed-off-by: Sun Yuechi <sunyuechi@iscas.ac.cn>
+---
+ src/mds/MDCache.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/mds/MDCache.cc b/src/mds/MDCache.cc
+index c857ff0cc77..de1f6aca2fd 100644
+--- a/src/mds/MDCache.cc
++++ b/src/mds/MDCache.cc
+@@ -10173,7 +10173,7 @@ void MDCache::request_forward(const MDRequestRef& mdr, mds_rank_t who, int port)
+     // the requesting mds holds the stray dentry until it gets a reply,
+     // see Server::handle_client_reply()
+     if (mdr->client_request->get_op() == CEPH_MDS_OP_RENAME) {
+-      auto reply = make_message<MClientReply>(*mdr->client_request, -EAGAIN);
++      auto reply = ceph::make_message<MClientReply>(*mdr->client_request, -EAGAIN);
+       mds->send_message(reply, mdr->client_request->get_connection());
+     }
+   }
+-- 
+2.56.1
+

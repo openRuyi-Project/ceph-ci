@@ -61,6 +61,9 @@ TREE_PATCHES=(
     # https://github.com/ceph/ceph/pull/72237
     1141-test-shrink-benchmark-iterations-under-any-sanitizer.patch
 
+    # https://github.com/ceph/ceph/pull/74101
+    1142-mds-fully-qualify-make_message-in-mdcache.patch
+
     # -- 2xxx: openRuyi downstream, not for upstream --
     # bump pylint 2.6.0 -> 2.17.7 for py3.13 / wrapt compat
     2001-monitoring-ceph-mixin-bump-pylint.patch
